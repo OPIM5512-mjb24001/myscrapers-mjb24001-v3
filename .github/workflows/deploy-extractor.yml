@@ -88,34 +88,45 @@ jobs:
 
       # REQUIRED bindings for Cloud Scheduler OIDC using RUNTIME_SA
       - name: Bootstrap IAM for Scheduler OIDC (runtime SA)
+        shell: bash
         run: |
           set -euo pipefail
-          if [[ -n "${RUNTIME_SA:-}" ]]; then
-            PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
-            SCHED_AGENT="service-${PROJECT_NUMBER}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
-            echo "Scheduler agent: ${SCHED_AGENT}"
 
-            # 1) Scheduler may mint OIDC tokens as the runtime SA
-            gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA}" \
-              --member="serviceAccount:${SCHED_AGENT}" \
-              --role="roles/iam.serviceAccountTokenCreator" || {
-                echo "::error::Permission denied adding tokenCreator to ${RUNTIME_SA}. Run (once as project owner):"
-                echo "gcloud iam service-accounts add-iam-policy-binding \"${RUNTIME_SA}\" --member=\"serviceAccount:${SCHED_AGENT}\" --role=\"roles/iam.serviceAccountTokenCreator\""
-                exit 1
-              }
-
-            # 2) Deployer may 'actAs' the runtime SA to create/update the job
-            gcloud iam service-accounts add-iam-policy-binding "${RUNTIME_SA}" \
-              --member="serviceAccount:${DEPLOYER_SA}" \
-              --role="roles/iam.serviceAccountUser" || {
-                echo "::error::Permission denied adding ServiceAccountUser for ${DEPLOYER_SA} on ${RUNTIME_SA}. Run:"
-                echo "gcloud iam service-accounts add-iam-policy-binding \"${RUNTIME_SA}\" --member=\"serviceAccount:${DEPLOYER_SA}\" --role=\"roles/iam.serviceAccountUser\""
-                exit 1
-              }
-          else
+          if [[ -z "${RUNTIME_SA:-}" ]]; then
             echo "::error::RUNTIME_SA is not set. Add repo variable RUNTIME_SA."
             exit 1
           fi
+
+          PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
+          SCHED_AGENT="service-${PROJECT_NUMBER}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
+          echo "Scheduler agent: ${SCHED_AGENT}"
+
+          retry_add_binding () {
+            local sa="$1"
+            local member="$2"
+            local role="$3"
+
+            for i in 1 2 3 4 5; do
+              if gcloud iam service-accounts add-iam-policy-binding "${sa}" \
+                --member="${member}" \
+                --role="${role}"; then
+                return 0
+              fi
+              echo "Retry $i failed for ${member} -> ${role}; sleeping..."
+              sleep $((i * 2))
+            done
+
+            echo "::error::Failed to add ${role} for ${member} on ${sa}"
+            exit 1
+          }
+
+          retry_add_binding "${RUNTIME_SA}" \
+            "serviceAccount:${SCHED_AGENT}" \
+            "roles/iam.serviceAccountTokenCreator"
+
+          retry_add_binding "${RUNTIME_SA}" \
+            "serviceAccount:${DEPLOYER_SA}" \
+            "roles/iam.serviceAccountUser"
 
       - name: Create/Update Cloud Scheduler job (:10 ET, uses runtime SA OIDC)
         shell: bash
