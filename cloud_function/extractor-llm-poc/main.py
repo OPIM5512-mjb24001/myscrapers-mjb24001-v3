@@ -24,7 +24,7 @@ from google.cloud import storage
 
 # ---- REQUIRED VERTEX AI IMPORTS ----
 import vertexai
-from vertexai.generative_models import GenerativeModel, GenerationConfig, Content
+from vertexai.generative_models import GenerativeModel, GenerationConfig
 from google.api_core.exceptions import ResourceExhausted, InternalServerError, Aborted, DeadlineExceeded
 
 # -------------------- ENV --------------------
@@ -153,14 +153,150 @@ def _safe_int(x):
         return None
 
 
+def _collapse_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _optional_str(x) -> str | None:
+    """Empty string -> None; strip whitespace."""
+    if x is None:
+        return None
+    s = _collapse_ws(str(x).replace("\u00a0", " "))
+    return s if s else None
+
+
+def _norm_make(s: str | None) -> str | None:
+    if not s:
+        return None
+    return s.title()
+
+
+def _norm_model(s: str | None) -> str | None:
+    """Strip and collapse whitespace; do not over-normalize spelling."""
+    return _optional_str(s)
+
+
+def _normalize_transmission(raw: str | None) -> str | None:
+    s = _optional_str(raw)
+    if not s:
+        return None
+    low = s.lower()
+    if "cvt" in low:
+        return "cvt"
+    if "automatic transmission" in low or low in ("auto", "automatic", "at") or low.startswith("auto "):
+        return "automatic"
+    if "manual" in low or "stick" in low or re.search(r"\b[45678]-speed\b", low):
+        return "manual"
+    allowed = {"automatic", "manual", "cvt", "other"}
+    if low in allowed:
+        return low
+    return "other"
+
+
+def _normalize_fuel(raw: str | None) -> str | None:
+    s = _optional_str(raw)
+    if not s:
+        return None
+    low = s.lower().replace("-", " ")
+    low = re.sub(r"\s+", " ", low)
+    if ("plug" in low and "hybrid" in low) or "phev" in low or "plug in hybrid" in low:
+        return "plug-in hybrid"
+    if "hybrid electric" in low or (low == "hybrid"):
+        return "hybrid"
+    if low in ("ev", "electric", "bev") or "electric vehicle" in low:
+        return "electric"
+    if low in ("gasoline", "gas", "petrol"):
+        return "gas"
+    if "diesel" in low:
+        return "diesel"
+    if "flex" in low and "fuel" in low or "e85" in low:
+        return "flex fuel"
+    allowed = {"gas", "diesel", "hybrid", "electric", "plug-in hybrid", "flex fuel", "other"}
+    if low in allowed:
+        return low
+    return "other"
+
+
+def _normalize_body_type(raw: str | None) -> str | None:
+    s = _optional_str(raw)
+    if not s:
+        return None
+    low = s.lower()
+    if "sport utility" in low or "crossover" in low or low in ("suv", "cuv"):
+        return "suv"
+    if "pickup" in low or low in ("pick up", "pick-up"):
+        return "truck"
+    allowed = {
+        "sedan", "suv", "truck", "coupe", "hatchback", "wagon", "van",
+        "minivan", "convertible", "other",
+    }
+    if low in allowed:
+        return low
+    return "other"
+
+
+def _normalize_title_status(raw: str | None) -> str | None:
+    s = _optional_str(raw)
+    if not s:
+        return None
+    low = s.lower()
+    if "clean title" in low or low == "clean":
+        return "clean"
+    if "rebuilt title" in low or low == "rebuilt":
+        return "rebuilt"
+    if "salvage title" in low or low == "salvage":
+        return "salvage"
+    if "lien" in low:
+        return "lien"
+    if "parts only" in low or "parts-only" in low:
+        return "parts only"
+    if "missing" in low:
+        return "missing"
+    allowed = {"clean", "rebuilt", "salvage", "lien", "parts only", "missing", "other"}
+    if low in allowed:
+        return low
+    return "other"
+
+
+def _normalize_condition(raw: str | None) -> str | None:
+    s = _optional_str(raw)
+    if not s:
+        return None
+    low = s.lower()
+    if "very clean" in low or "excellent condition" in low:
+        return "excellent"
+    if "runs good" in low or low == "runs great":
+        return "good"
+    if "mechanic special" in low or "project car" in low or low == "project":
+        return "project"
+    if "like new" in low or low.replace("-", " ") == "like new":
+        return "like new"
+    allowed = {"like new", "excellent", "good", "fair", "poor", "project", "other"}
+    if low in allowed:
+        return low
+    return "other"
+
+
+def _normalize_exterior_color(raw: str | None) -> str | None:
+    """Plain English color if stated; strip only — do not invent."""
+    s = _optional_str(raw)
+    if not s:
+        return None
+    # Title-case words for readable CSV (e.g. "midnight blue")
+    return s.title()
+
+
 # -------------------- VERTEX AI CALL --------------------
 def _vertex_extract_fields(raw_text: str) -> dict:
     """
-    Ask Gemini to return JSON with exactly: price, year, make, model, transmission, mileage.
+    Ask Gemini to return JSON matching the response schema (vehicle fields + categoricals).
     """
     model = _get_vertex_model()
 
-    # Strict JSON schema - FIX: Removed "additionalProperties": False
+    # NBSP -> space before model/prompt (matches header note)
+    raw_text = (raw_text or "").replace("\u00a0", " ")
+
+    # Strict JSON schema - do not add additionalProperties (Vertex sensitivity)
     schema = {
         "type": "object",
         "properties": {
@@ -168,23 +304,36 @@ def _vertex_extract_fields(raw_text: str) -> dict:
             "year": {"type": "integer", "nullable": True},
             "make": {"type": "string", "nullable": True},
             "model": {"type": "string", "nullable": True},
-            "transmission": {"type": "string", "nullable": True},
             "mileage": {"type": "integer", "nullable": True},
+            "transmission": {"type": "string", "nullable": True},
+            "fuel": {"type": "string", "nullable": True},
+            "body_type": {"type": "string", "nullable": True},
+            "exterior_color": {"type": "string", "nullable": True},
+            "title_status": {"type": "string", "nullable": True},
+            "condition": {"type": "string", "nullable": True},
         },
-        "required": ["price", "year", "make", "model", "transmission", "mileage"]
+        "required": ["price", "year", "make", "model", "mileage"],
     }
 
-    # System instruction (will be prepended to the prompt)
     sys_instr = (
-        "Extract ONLY the following fields from the input text. "
-        "Return a strict JSON object that conforms to the provided schema. "
-        "If a value is not present, use null. "
-        "Rules: integers for price/year/mileage; price in USD; mileage in miles; "
-        "the transmission can be manual or automatic, or if not listed, write null."
-        "do not infer values not explicitly present; do not add extra keys."
+        "You extract structured vehicle listing fields from the text below.\n"
+        "Return STRICT JSON ONLY — one JSON object, no markdown, no commentary.\n"
+        "Use ONLY these keys (exact spelling): price, year, make, model, mileage, "
+        "transmission, fuel, body_type, exterior_color, title_status, condition.\n"
+        "Use null if a value is unclear, ambiguous, or not explicitly stated in the text. "
+        "Do NOT invent or guess facts.\n"
+        "Normalize categorical strings to one of the allowed labels when possible (lowercase):\n"
+        "- transmission: automatic | manual | cvt | other | null\n"
+        "- fuel: gas | diesel | hybrid | electric | plug-in hybrid | flex fuel | other | null\n"
+        "- body_type: sedan | suv | truck | coupe | hatchback | wagon | van | minivan | "
+        "convertible | other | null\n"
+        "- title_status: clean | rebuilt | salvage | lien | parts only | missing | other | null\n"
+        "- condition: like new | excellent | good | fair | poor | project | other | null\n"
+        "- exterior_color: plain English color phrase ONLY if clearly stated (e.g. silver, black); "
+        "otherwise null\n"
+        "Integers: price (USD), year (4-digit), mileage (miles). Use null if not explicit."
     )
 
-    # FIX: Combine instruction and text into one prompt string (SDK compatibility)
     prompt = f"{sys_instr}\n\nTEXT:\n{raw_text}"
 
     gen_cfg = GenerationConfig(
@@ -220,18 +369,19 @@ def _vertex_extract_fields(raw_text: str) -> dict:
 
     parsed = json.loads(resp.text)
 
-    # Normalize fields post-extraction
+    # Numeric cleanup
     parsed["price"] = _safe_int(parsed.get("price"))
     parsed["year"] = _safe_int(parsed.get("year"))
     parsed["mileage"] = _safe_int(parsed.get("mileage"))
-    
-    def _norm_str(s):
-        if s is None: return None
-        s = str(s).strip()
-        return s if s else None
 
-    parsed["make"] = _norm_str(parsed.get("make"))
-    parsed["model"] = _norm_str(parsed.get("model"))
+    parsed["make"] = _norm_make(_optional_str(parsed.get("make")))
+    parsed["model"] = _norm_model(parsed.get("model"))
+    parsed["transmission"] = _normalize_transmission(parsed.get("transmission"))
+    parsed["fuel"] = _normalize_fuel(parsed.get("fuel"))
+    parsed["body_type"] = _normalize_body_type(parsed.get("body_type"))
+    parsed["exterior_color"] = _normalize_exterior_color(parsed.get("exterior_color"))
+    parsed["title_status"] = _normalize_title_status(parsed.get("title_status"))
+    parsed["condition"] = _normalize_condition(parsed.get("condition"))
 
     return parsed
 
@@ -321,6 +471,11 @@ def llm_extract_http(request: Request):
                 "model": parsed.get("model"),
                 "mileage": parsed.get("mileage"),
                 "transmission": parsed.get("transmission"),
+                "fuel": parsed.get("fuel"),
+                "body_type": parsed.get("body_type"),
+                "exterior_color": parsed.get("exterior_color"),
+                "title_status": parsed.get("title_status"),
+                "condition": parsed.get("condition"),
                 "llm_provider": "vertex",
                 "llm_model": LLM_MODEL,
                 "llm_ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

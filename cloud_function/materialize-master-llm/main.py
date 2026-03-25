@@ -1,7 +1,7 @@
 # main.py
-# Build a single, ever-growing CSV from all structured JSONL files.
-# Reads:  gs://<bucket>/<STRUCTURED_PREFIX>/run_id=*/jsonl/*.jsonl
-# Writes: gs://<bucket>/<STRUCTURED_PREFIX>/datasets/listings_master.csv  (atomic publish)
+# Build a single CSV of LLM-extracted listings from all structured runs.
+# Reads:  gs://<bucket>/<STRUCTURED_PREFIX>/run_id=*/jsonl_llm/*.jsonl
+# Writes: gs://<bucket>/<STRUCTURED_PREFIX>/datasets/listings_master_llm.csv
 
 import csv
 import io
@@ -24,11 +24,13 @@ storage_client = storage.Client()
 RUN_ID_ISO_RE   = re.compile(r"^\d{8}T\d{6}Z$")  # 20251026T170002Z
 RUN_ID_PLAIN_RE = re.compile(r"^\d{14}$")        # 20251026170002
 
-# Stable CSV schema for students
+# Stable CSV schema (LLM fields + provenance)
 CSV_COLUMNS = [
     "post_id", "run_id", "scraped_at",
-    "price", "year", "make", "model", "mileage", "transmission",
-    "source_txt"
+    "price", "year", "make", "model", "mileage",
+    "transmission", "fuel", "body_type", "exterior_color", "title_status", "condition",
+    "source_txt",
+    "llm_provider", "llm_model", "llm_ts",
 ]
 
 def _list_run_ids(bucket: str, structured_prefix: str) -> list[str]:
@@ -45,7 +47,7 @@ def _list_run_ids(bucket: str, structured_prefix: str) -> list[str]:
     return sorted(run_ids)
 
 def _jsonl_records_for_run(bucket: str, structured_prefix: str, run_id: str):
-    """Yield dict records from .jsonl under .../run_id=<run_id>/jsonl/ (one JSON per file)."""
+    """Yield dict records from .jsonl under .../run_id=<run_id>/jsonl_llm/ (one JSON per file)."""
     b = storage_client.bucket(bucket)
     prefix = f"{structured_prefix}/run_id={run_id}/jsonl_llm/"
     for blob in b.list_blobs(prefix=prefix):
@@ -93,8 +95,8 @@ def _write_csv(records: Iterable[Dict], dest_key: str, columns=CSV_COLUMNS) -> i
 def materialize_http(request: Request):
     """
     HTTP POST (no body needed).
-    Crawls ALL structured run folders, de-dupes by post_id (keep newest run),
-    and writes one CSV directly to .../datasets/listings_master.csv.
+    Crawls ALL structured run folders, de-dupes by post_id (keep newest run_id),
+    and writes one CSV to .../datasets/listings_master_llm.csv.
     Returns JSON with counts and output path.
     """
     try:
