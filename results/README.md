@@ -9,5 +9,3 @@ Populated by **GitHub Actions → Sync model artifacts to repo** from GCS `struc
 | `permutation_importance/` | `<run_id>-permutation_importance.csv` |
 | `pdp/` | `<run_id>_pdp_top*.png` |
 | `history/` | `metrics_history.csv` (cumulative) |
-
-Do not add new artifacts to this directory root; use the subfolders above.
