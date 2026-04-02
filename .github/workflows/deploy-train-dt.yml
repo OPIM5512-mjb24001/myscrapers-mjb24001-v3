@@ -29,7 +29,11 @@ env:
   RUNTIME_SA: ${{ vars.RUNTIME_SA }}                 # function runtime SA (email)
   DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}               # GitHub deploy SA (email)
   WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
-  SCHEDULE_BODY: ${{ vars.TRAIN_DT_BODY ||'{"dry_run":true}'}}
+  # Hourly Cloud Scheduler: production default writes GCS artifacts (dry_run=false).
+  # To test without writes, set repo variable TRAIN_DT_BODY to {"dry_run":true}.
+  SCHEDULE_BODY: ${{ vars.TRAIN_DT_BODY || '{"dry_run":false}' }}
+  # Post-deploy smoke only — avoids a full training run on every workflow push.
+  SMOKE_BODY: '{"dry_run":true}'
   CRON_EXPR: "20 * * * *"                             # :20 each hour (ET)
 
 jobs:
@@ -205,4 +209,4 @@ jobs:
           curl -i -sS -X POST "$URL" \
             -H "Authorization: Bearer ${TOKEN}" \
             -H "Content-Type: application/json" \
-            -d '${{ env.SCHEDULE_BODY }}' || true
+            -d '${{ env.SMOKE_BODY }}' || true

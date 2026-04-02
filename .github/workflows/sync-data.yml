@@ -1,3 +1,5 @@
+# Pulls the latest GCS training run from structured/model_runs/<YYYYMMDDHH>/
+# and commits into repo subfolders only (never writes CSV/JSON to results/ root).
 name: Sync model artifacts to repo
 run-name: Sync model run artifacts for ${{ github.ref_name }} by @${{ github.actor }}
 on:
@@ -46,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           BASE="gs://${BUCKET_NAME}/${GCS_MODEL_RUNS_PREFIX}"
-          # Latest timestamped run directory (10-digit YYYYMMDDHH)
+          # Latest lexicographic run id matches chronological YYYYMMDDHH
           LATEST_DIR=$(gsutil ls -d "${BASE}/"*/ 2>/dev/null | grep -E '/[0-9]{10}/$' | sort | tail -1 || true)
           if [[ -z "${LATEST_DIR:-}" ]]; then
             echo "No model run directories under ${BASE}/"
