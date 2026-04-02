@@ -1,0 +1,21 @@
+{
+  "run_id": "2026040220",
+  "timezone": "America/New_York",
+  "eval_date_local": "2026-04-02",
+  "train_rows": 180,
+  "holdout_rows": 271,
+  "mae": 5807.310446096433,
+  "mape": 76.73855065856702,
+  "rmse": 12460.629498551625,
+  "bias": -967.9106142967764,
+  "baseline_dt_mae_tune_val": 9461.142122113997,
+  "tuning": "val_date=2026-04-01 best_mae=6411.38",
+  "best_rf_params": {
+    "n_estimators": 100,
+    "min_samples_leaf": 2,
+    "max_features": 0.3,
+    "max_depth": 20
+  },
+  "data_key": "structured/datasets/listings_master_llm.csv",
+  "model": "RandomForestRegressor"
+}
