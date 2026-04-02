@@ -20,7 +20,7 @@ University project pipeline that scrapes Craigslist car listings (scraper **unch
 | Master CSV | Narrow columns | Full enriched schema (see below) |
 | Model | Single decision tree, MAE only | Tuned **RandomForest**, MAE / MAPE / RMSE / Bias, permutation importance, PDPs |
 | Artifacts | `structured/preds/.../preds.csv` only | `structured/model_runs/<id>/` (+ cumulative `metrics_history.csv`) |
-| Sync | Flat `results/*-preds.csv` | `results/predictions`, `metrics`, `permutation_importance`, `pdp`, `history` |
+| Sync | Flat `results/*-preds.csv` (legacy) | `results/{predictions,metrics,...}` + legacy files in `archive/legacy_predictions/` |
 
 ## Final ETL schema (canonical CSV)
 
@@ -50,30 +50,32 @@ Each training run (not dry run) writes to `gs://<bucket>/structured/model_runs/<
 | `model_info.json` | Feature lists, params, data key |
 | `metrics_history.csv` | Snapshot of cumulative history (also appended to `structured/model_runs/metrics_history.csv`) |
 
-## Repo `results/` layout (after sync)
+## Repo `results/` layout (grading / notebook)
+
+Synced artifacts land **only** in these subfolders (no new files committed to `results/` root):
 
 ```
 results/
-  predictions/     <run_id>-predictions.csv
-  metrics/         <run_id>-metrics.json, <run_id>-metrics.csv, <run_id>-model_info.json
-  permutation_importance/  <run_id>-permutation_importance.csv
-  pdp/             <run_id>_pdp_top*.png
-  history/         metrics_history.csv   (cumulative)
+  predictions/              <run_id>-predictions.csv
+  metrics/                    <run_id>-metrics.json, <run_id>-metrics.csv, <run_id>-model_info.json
+  permutation_importance/     <run_id>-permutation_importance.csv
+  pdp/                        <run_id>_pdp_top*.png  (may be empty until a run produces PDPs)
+  history/                    metrics_history.csv    (cumulative, overwritten each sync)
 ```
+
+**Legacy hourly decision-tree predictions** (`*-preds.csv`) are preserved under **`archive/legacy_predictions/`** so the GitHub tree stays browsable. They are not used by the current notebook.
 
 ## Notebook (Colab / local)
 
 - Path: [`notebooks/model_trending.ipynb`](notebooks/model_trending.ipynb)
-- **No GCP credentials** and **no retraining** — only reads synced files under `results/`.
-- **Colab**: set environment variables before running, or edit defaults in the first cell:
-  - `NOTEBOOK_REPO_URL` — your GitHub repo URL
-  - `NOTEBOOK_REPO_BRANCH` — default `main`
+- **No GCP credentials** and **no retraining** — only reads synced files under `results/{history,permutation_importance,pdp}/` and related paths.
+- **Colab**: defaults clone **`https://github.com/OPIM5512-mjb24001/myscrapers-mjb24001-v3.git`**. For a fork, set `NOTEBOOK_REPO_URL` (optional: `NOTEBOOK_REPO_BRANCH`, default `main`).
 
 ## How to run / validate
 
 1. Deploy Cloud Functions via existing workflows (`deploy-extractor`, `deploy-extractor-llm`, `deploy-materialize-master-llm`, `deploy-train-dt`).
 2. Ensure scheduler / manual POST runs materialize so **`listings_master_llm.csv`** exists.
-3. Invoke `train-dt` with **`{"dry_run": false}`** (repo variable `TRAIN_DT_BODY` / `SCHEDULE_BODY`) so artifacts are written.
+3. **Training writes artifacts by default:** Cloud Scheduler uses `dry_run: false` unless repo variable **`TRAIN_DT_BODY`** overrides it (set to `{"dry_run":true}` for safe testing). Post-deploy workflow smoke tests use `dry_run: true` only so pushes do not trigger a full train.
 4. Run **`Sync model artifacts to repo`** workflow (hourly or `workflow_dispatch`) to refresh `results/`.
 5. Open the notebook and run all cells.
 
