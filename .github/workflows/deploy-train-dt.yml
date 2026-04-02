@@ -22,8 +22,9 @@ env:
   BUCKET_NAME: ${{ vars.BUCKET_NAME }}
   TIMEOUT_SECONDS: "900"
   MEMORY: "2Gi"
-  DATA_KEY: "structured/datasets/listings_master.csv"
-  OUTPUT_PREFIX: "structured/preds"
+  DATA_KEY: "structured/datasets/listings_master_llm.csv"
+  MODEL_RUN_PREFIX: "structured/model_runs"
+  METRICS_HISTORY_KEY: "structured/model_runs/metrics_history.csv"
   # Align with your other workflows
   RUNTIME_SA: ${{ vars.RUNTIME_SA }}                 # function runtime SA (email)
   DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}               # GitHub deploy SA (email)
@@ -79,7 +80,7 @@ jobs:
             --timeout="${TIMEOUT_SECONDS}" \
             --memory="${MEMORY}" \
             "${SA_ARGS[@]}" \
-            --set-env-vars="PROJECT_ID=${PROJECT_ID},GCS_BUCKET=${BUCKET_NAME},DATA_KEY=${DATA_KEY},OUTPUT_PREFIX=${OUTPUT_PREFIX}"
+            --set-env-vars="PROJECT_ID=${PROJECT_ID},GCS_BUCKET=${BUCKET_NAME},DATA_KEY=${DATA_KEY},MODEL_RUN_PREFIX=${MODEL_RUN_PREFIX},METRICS_HISTORY_KEY=${METRICS_HISTORY_KEY}"
 
       - name: Grant invoker to deployer & runtime SAs
         shell: bash

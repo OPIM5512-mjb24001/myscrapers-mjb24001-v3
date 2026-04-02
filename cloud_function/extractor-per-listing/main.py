@@ -107,6 +107,140 @@ def _parse_run_id_as_iso(run_id: str) -> str:
     except Exception:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+def _norm_attr_value(s: str) -> str:
+    s = re.sub(r"\s+", " ", (s or "").strip())
+    return s if s else ""
+
+
+def _parse_attr_line(text: str, label: str) -> str | None:
+    """Craigslist-style 'label: value' on same line (case-insensitive)."""
+    pat = re.compile(rf"(?im)^\s*{re.escape(label)}\s*[:\-]\s*([^\n]+?)\s*$")
+    m = pat.search(text)
+    if not m:
+        return None
+    v = _norm_attr_value(m.group(1))
+    return v if v else None
+
+
+def _normalize_transmission_regex(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    low = raw.lower()
+    if "cvt" in low:
+        return "cvt"
+    if "automatic" in low or low in ("auto", "at"):
+        return "automatic"
+    if "manual" in low or "stick" in low:
+        return "manual"
+    return None
+
+
+def _normalize_drive_regex(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    low = re.sub(r"[\s\-]+", "", raw.lower())
+    if "4wd" in low or "4x4" in low or "fourwheel" in low.replace(" ", ""):
+        return "4wd"
+    if "awd" in low:
+        return "awd"
+    if "fwd" in low or "front" in low:
+        return "fwd"
+    if "rwd" in low or "rear" in low:
+        return "rwd"
+    return None
+
+
+def _normalize_fuel_regex(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    low = raw.lower().replace("-", " ")
+    if "diesel" in low:
+        return "diesel"
+    if "electric" in low or low.strip() == "ev":
+        return "electric"
+    if "hybrid" in low:
+        return "hybrid"
+    if "flex" in low or "e85" in low:
+        return "flex fuel"
+    if "gas" in low or "petrol" in low:
+        return "gas"
+    return None
+
+
+def _normalize_title_regex(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    low = raw.lower()
+    for token in ("clean", "rebuilt", "salvage", "lien", "missing"):
+        if token in low:
+            return token if token != "missing" else "missing"
+    if "parts" in low:
+        return "parts only"
+    return None
+
+
+def _normalize_condition_regex(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    low = raw.lower()
+    for lab in ("like new", "excellent", "good", "fair", "poor", "project"):
+        if lab in low or low == lab.replace(" ", ""):
+            return lab
+    return None
+
+
+def _normalize_type_regex(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    low = raw.lower()
+    mapping = {
+        "sedan": "sedan", "suv": "suv", "truck": "truck", "pickup": "truck",
+        "coupe": "coupe", "hatchback": "hatchback", "wagon": "wagon",
+        "van": "van", "minivan": "minivan", "convertible": "convertible",
+    }
+    for k, v in mapping.items():
+        if k in low:
+            return v
+    return None
+
+
+def _normalize_seller_regex(text: str) -> str | None:
+    t = text.lower()
+    if re.search(r"\bby\s+dealer\b", t) or re.search(r"\bdealer\b", t) and "private" not in t:
+        return "dealer"
+    if re.search(r"\bby\s+owner\b", t) or re.search(r"\bprivate\b", t):
+        return "private"
+    return None
+
+
+def _extract_zip_regex(text: str) -> str | None:
+    """Only explicit 5-digit US ZIP (do not guess from partial digits)."""
+    m = re.search(r"\b(\d{5})(?:-\d{4})?\b", text)
+    return m.group(1) if m else None
+
+
+def _extract_state_city_regex(text: str) -> tuple[str | None, str | None]:
+    """
+    Heuristic: 'City, ST' or 'ST' two-letter state near location lines.
+    Conservative: only when pattern is clear.
+    """
+    city, state = None, None
+    m = re.search(
+        r"\b([A-Za-z][A-Za-z\s\.\-]{1,40}?)\s*,\s*([A-Z]{2})\b",
+        text,
+    )
+    if m:
+        city = _norm_attr_value(m.group(1))
+        state = m.group(2).upper()
+        if len(city) < 2:
+            city = None
+    if state is None:
+        m2 = re.search(r"\b([A-Z]{2})\s+\d{5}\b", text)
+        if m2:
+            state = m2.group(1)
+    return city, state
+
+
 # -------------------- PARSE A LISTING --------------------
 def parse_listing(text: str) -> dict:
     d = {}
@@ -134,20 +268,92 @@ def parse_listing(text: str) -> dict:
     mi = None
     m1 = re.search(r"(?:mileage|odometer)\s*[:\-]?\s*([\d,]+)", text, re.I)
     if m1:
-        try: mi = int(m1.group(1).replace(",", ""))
-        except ValueError: mi = None
+        try:
+            mi = int(m1.group(1).replace(",", ""))
+        except ValueError:
+            mi = None
     if mi is None:
         m2 = re.search(r"(\d+(?:\.\d+)?)\s*k\s*(?:mi|mile|miles)\b", text, re.I)
         if m2:
-            try: mi = int(float(m2.group(1)) * 1000)
-            except ValueError: mi = None
+            try:
+                mi = int(float(m2.group(1)) * 1000)
+            except ValueError:
+                mi = None
     if mi is None:
         m3 = re.search(r"(\d{1,3}(?:[,\d]{3})*)\s*(?:mi|mile|miles)\b", text, re.I)
         if m3:
-            try: mi = int(re.sub(r"[^\d]", "", m3.group(1)))
-            except ValueError: mi = None
+            try:
+                mi = int(re.sub(r"[^\d]", "", m3.group(1)))
+            except ValueError:
+                mi = None
     if mi is not None:
         d["mileage"] = mi
+
+    # --- Structured attribute lines (Craigslist-style) ---
+    trans_raw = _parse_attr_line(text, "transmission")
+    if trans_raw:
+        nt = _normalize_transmission_regex(trans_raw)
+        if nt:
+            d["transmission"] = nt
+
+    color_raw = _parse_attr_line(text, "paint color") or _parse_attr_line(text, "color")
+    if color_raw:
+        d["color"] = color_raw.title()
+
+    drive_raw = _parse_attr_line(text, "drive")
+    if drive_raw:
+        nd = _normalize_drive_regex(drive_raw)
+        if nd:
+            d["drive"] = nd
+
+    fuel_raw = _parse_attr_line(text, "fuel")
+    if fuel_raw:
+        nf = _normalize_fuel_regex(fuel_raw)
+        if nf:
+            d["fuel"] = nf
+
+    cond_raw = _parse_attr_line(text, "condition")
+    if cond_raw:
+        nc = _normalize_condition_regex(cond_raw)
+        if nc:
+            d["condition"] = nc
+
+    title_raw = _parse_attr_line(text, "title status") or _parse_attr_line(text, "title")
+    if title_raw:
+        nt = _normalize_title_regex(title_raw)
+        if nt:
+            d["title_status"] = nt
+
+    type_raw = _parse_attr_line(text, "type")
+    if type_raw:
+        nty = _normalize_type_regex(type_raw)
+        if nty:
+            d["type"] = nty
+
+    cyl_raw = _parse_attr_line(text, "cylinders")
+    if cyl_raw:
+        cm = re.search(r"(\d+)", cyl_raw)
+        if cm:
+            try:
+                n = int(cm.group(1))
+                if 0 < n <= 16:
+                    d["cylinders"] = n
+            except ValueError:
+                pass
+
+    seller = _normalize_seller_regex(text)
+    if seller:
+        d["seller_type"] = seller
+
+    z = _extract_zip_regex(text)
+    if z:
+        d["zip_code"] = z
+
+    cty, st = _extract_state_city_regex(text)
+    if cty:
+        d["city"] = cty
+    if st:
+        d["state"] = st
 
     return d
 
@@ -221,7 +427,7 @@ def extract_http(request: Request):
 
     result = {
         "ok": True,
-        "version": "extractor-v3-jsonl-flex",
+        "version": "extractor-v4-regex-enriched",
         "run_id": run_id,
         "processed_txt": processed,
         "written_jsonl": written,

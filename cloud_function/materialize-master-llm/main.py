@@ -24,13 +24,32 @@ storage_client = storage.Client()
 RUN_ID_ISO_RE   = re.compile(r"^\d{8}T\d{6}Z$")  # 20251026T170002Z
 RUN_ID_PLAIN_RE = re.compile(r"^\d{14}$")        # 20251026170002
 
-# Stable CSV schema (LLM fields + provenance)
+# Canonical enriched schema (hybrid regex + LLM + provenance)
 CSV_COLUMNS = [
-    "post_id", "run_id", "scraped_at",
-    "price", "year", "make", "model", "mileage",
-    "transmission", "fuel", "body_type", "exterior_color", "title_status", "condition",
+    "post_id",
+    "run_id",
+    "scraped_at",
     "source_txt",
-    "llm_provider", "llm_model", "llm_ts",
+    "price",
+    "year",
+    "make",
+    "model",
+    "mileage",
+    "transmission",
+    "color",
+    "city",
+    "state",
+    "zip_code",
+    "drive",
+    "fuel",
+    "condition",
+    "title_status",
+    "type",
+    "cylinders",
+    "seller_type",
+    "llm_provider",
+    "llm_model",
+    "llm_ts",
 ]
 
 def _list_run_ids(bucket: str, structured_prefix: str) -> list[str]:

@@ -61,6 +61,21 @@ _CACHED_MODEL_OBJ = None
 RUN_ID_ISO_RE    = re.compile(r"^\d{8}T\d{6}Z$")
 RUN_ID_PLAIN_RE = re.compile(r"^\d{14}$")
 
+# Keys from regex JSONL passed to the LLM as hints (regex-first, LLM-second merge).
+REGEX_HINT_KEYS = frozenset({
+    "price", "year", "make", "model", "mileage",
+    "transmission", "color", "city", "state", "zip_code",
+    "drive", "fuel", "condition", "title_status", "type",
+    "cylinders", "seller_type",
+})
+
+OUTPUT_FIELD_KEYS = [
+    "price", "year", "make", "model", "mileage",
+    "transmission", "color", "city", "state", "zip_code",
+    "drive", "fuel", "condition", "title_status", "type",
+    "cylinders", "seller_type",
+]
+
 
 # -------------------- HELPERS --------------------
 def _get_vertex_model() -> GenerativeModel:
@@ -217,7 +232,8 @@ def _normalize_fuel(raw: str | None) -> str | None:
     return "other"
 
 
-def _normalize_body_type(raw: str | None) -> str | None:
+def _normalize_type(raw: str | None) -> str | None:
+    """Vehicle body / listing type (rubric: type)."""
     s = _optional_str(raw)
     if not s:
         return None
@@ -233,6 +249,71 @@ def _normalize_body_type(raw: str | None) -> str | None:
     if low in allowed:
         return low
     return "other"
+
+
+def _normalize_drive(raw: str | None) -> str | None:
+    s = _optional_str(raw)
+    if not s:
+        return None
+    low = re.sub(r"[\s\-]+", "", s.lower())
+    if "4wd" in low or "4x4" in low:
+        return "4wd"
+    if "awd" in low:
+        return "awd"
+    if "fwd" in low or "frontwheel" in low:
+        return "fwd"
+    if "rwd" in low or "rearwheel" in low:
+        return "rwd"
+    allowed = {"4wd", "awd", "fwd", "rwd", "other"}
+    if s.lower().strip() in allowed:
+        return s.lower().strip()
+    return "other"
+
+
+def _normalize_state(raw: str | None) -> str | None:
+    s = _optional_str(raw)
+    if not s:
+        return None
+    s2 = re.sub(r"[^A-Za-z]", "", s).upper()
+    if len(s2) == 2:
+        return s2
+    return None
+
+
+def _normalize_cylinders(raw) -> int | None:
+    n = _safe_int(raw)
+    if n is None:
+        return None
+    if 0 < n <= 16:
+        return n
+    return None
+
+
+def _normalize_seller_type(raw: str | None) -> str | None:
+    s = _optional_str(raw)
+    if not s:
+        return None
+    low = s.lower()
+    if "dealer" in low:
+        return "dealer"
+    if "private" in low or "owner" in low:
+        return "private"
+    allowed = {"dealer", "private", "other"}
+    if low in allowed:
+        return low
+    return "other"
+
+
+def _validate_zip_in_text(zip_candidate: str | None, raw_text: str) -> str | None:
+    """Reject ZIP unless the exact 5-digit token appears in listing text (anti-hallucination)."""
+    if not zip_candidate:
+        return None
+    z = re.sub(r"\D", "", str(zip_candidate).strip())
+    if len(z) != 5:
+        return None
+    if re.search(rf"\b{z}\b", raw_text or ""):
+        return z
+    return None
 
 
 def _normalize_title_status(raw: str | None) -> str | None:
@@ -277,26 +358,98 @@ def _normalize_condition(raw: str | None) -> str | None:
     return "other"
 
 
-def _normalize_exterior_color(raw: str | None) -> str | None:
-    """Plain English color if stated; strip only — do not invent."""
+def _normalize_color(raw: str | None) -> str | None:
+    """Plain English color if stated; do not invent."""
     s = _optional_str(raw)
     if not s:
         return None
-    # Title-case words for readable CSV (e.g. "midnight blue")
     return s.title()
 
 
-# -------------------- VERTEX AI CALL --------------------
-def _vertex_extract_fields(raw_text: str) -> dict:
+def _regex_hints_from_record(base_rec: dict) -> dict:
+    out = {}
+    for k in REGEX_HINT_KEYS:
+        if k not in base_rec:
+            continue
+        v = base_rec[k]
+        if v is None or v == "":
+            continue
+        out[k] = v
+    return out
+
+
+def _postprocess_llm_dict(parsed: dict) -> dict:
+    """Normalize LLM output fields."""
+    parsed["price"] = _safe_int(parsed.get("price"))
+    parsed["year"] = _safe_int(parsed.get("year"))
+    parsed["mileage"] = _safe_int(parsed.get("mileage"))
+    parsed["cylinders"] = _normalize_cylinders(parsed.get("cylinders"))
+
+    parsed["make"] = _norm_make(_optional_str(parsed.get("make")))
+    parsed["model"] = _norm_model(parsed.get("model"))
+    parsed["transmission"] = _normalize_transmission(parsed.get("transmission"))
+    parsed["fuel"] = _normalize_fuel(parsed.get("fuel"))
+    parsed["type"] = _normalize_type(parsed.get("type"))
+    parsed["color"] = _normalize_color(parsed.get("color"))
+    parsed["title_status"] = _normalize_title_status(parsed.get("title_status"))
+    parsed["condition"] = _normalize_condition(parsed.get("condition"))
+    parsed["drive"] = _normalize_drive(parsed.get("drive"))
+    parsed["city"] = _optional_str(parsed.get("city"))
+    if parsed["city"]:
+        parsed["city"] = parsed["city"].title()
+    parsed["state"] = _normalize_state(parsed.get("state"))
+    zraw = parsed.get("zip_code")
+    if zraw is None or str(zraw).strip() == "":
+        parsed["zip_code"] = None
+    else:
+        digits = re.sub(r"\D", "", str(zraw))
+        parsed["zip_code"] = digits[:5] if len(digits) >= 5 else None
+    parsed["seller_type"] = _normalize_seller_type(parsed.get("seller_type"))
+    return parsed
+
+
+def _merge_llm_and_regex(llm_norm: dict, regex_hints: dict, raw_text: str) -> dict:
     """
-    Ask Gemini to return JSON matching the response schema (vehicle fields + categoricals).
+    Prefer LLM when it returns a value; fall back to regex hints.
+    ZIP is only kept if the digit sequence appears verbatim in the listing text.
+    """
+    out = {}
+    for k in OUTPUT_FIELD_KEYS:
+        lv = llm_norm.get(k)
+        rv = regex_hints.get(k)
+
+        if k == "zip_code":
+            z_llm = _validate_zip_in_text(_optional_str(lv), raw_text)
+            z_re = _validate_zip_in_text(_optional_str(rv), raw_text)
+            out[k] = z_llm or z_re or None
+            continue
+
+        if k in ("price", "year", "mileage", "cylinders"):
+            if lv is not None:
+                out[k] = lv
+            else:
+                out[k] = rv if rv is not None else None
+            continue
+
+        # Strings / categoricals
+        if lv is not None and lv != "":
+            out[k] = lv
+        else:
+            out[k] = rv if rv not in (None, "") else None
+
+    return out
+
+
+# -------------------- VERTEX AI CALL --------------------
+def _vertex_extract_fields(raw_text: str, regex_hints: dict) -> dict:
+    """
+    Ask Gemini for strict JSON; regex_hints are advisory (regex-first pipeline).
     """
     model = _get_vertex_model()
 
-    # NBSP -> space before model/prompt (matches header note)
     raw_text = (raw_text or "").replace("\u00a0", " ")
+    hints_json = json.dumps(regex_hints, ensure_ascii=False, default=str)
 
-    # Strict JSON schema - do not add additionalProperties (Vertex sensitivity)
     schema = {
         "type": "object",
         "properties": {
@@ -306,38 +459,55 @@ def _vertex_extract_fields(raw_text: str) -> dict:
             "model": {"type": "string", "nullable": True},
             "mileage": {"type": "integer", "nullable": True},
             "transmission": {"type": "string", "nullable": True},
+            "color": {"type": "string", "nullable": True},
+            "city": {"type": "string", "nullable": True},
+            "state": {"type": "string", "nullable": True},
+            "zip_code": {"type": "string", "nullable": True},
+            "drive": {"type": "string", "nullable": True},
             "fuel": {"type": "string", "nullable": True},
-            "body_type": {"type": "string", "nullable": True},
-            "exterior_color": {"type": "string", "nullable": True},
-            "title_status": {"type": "string", "nullable": True},
             "condition": {"type": "string", "nullable": True},
+            "title_status": {"type": "string", "nullable": True},
+            "type": {"type": "string", "nullable": True},
+            "cylinders": {"type": "integer", "nullable": True},
+            "seller_type": {"type": "string", "nullable": True},
         },
-        "required": ["price", "year", "make", "model", "mileage"],
+        "required": [
+            "price", "year", "make", "model", "mileage",
+            "transmission", "color", "city", "state", "zip_code",
+            "drive", "fuel", "condition", "title_status", "type",
+            "cylinders", "seller_type",
+        ],
     }
 
     sys_instr = (
-        "You extract structured vehicle listing fields from the text below.\n"
+        "You extract structured vehicle listing fields from the TEXT below.\n"
         "Return STRICT JSON ONLY — one JSON object, no markdown, no commentary.\n"
-        "Use ONLY these keys (exact spelling): price, year, make, model, mileage, "
-        "transmission, fuel, body_type, exterior_color, title_status, condition.\n"
-        "Use null if a value is unclear, ambiguous, or not explicitly stated in the text. "
-        "Do NOT invent or guess facts.\n"
-        "Normalize categorical strings to one of the allowed labels when possible (lowercase):\n"
+        "Use EXACTLY these keys: price, year, make, model, mileage, transmission, color, "
+        "city, state, zip_code, drive, fuel, condition, title_status, type, cylinders, seller_type.\n"
+        "Use null if a value is unclear, ambiguous, or not explicitly stated in the TEXT.\n"
+        "Do NOT invent facts. Do NOT guess zip_code — use null unless a 5-digit US ZIP appears "
+        "explicitly in the TEXT.\n"
+        "Infer city and state ONLY if they clearly appear as location in the listing (e.g. "
+        "'Hartford, CT' or 'CT' near the title); otherwise null.\n"
+        "REGEX_HINTS_JSON (from a separate regex pass; may be incomplete or wrong): "
+        "prefer TEXT over hints when they conflict; use hints only to disambiguate when helpful.\n"
+        "Normalize categoricals when possible (lowercase labels):\n"
         "- transmission: automatic | manual | cvt | other | null\n"
         "- fuel: gas | diesel | hybrid | electric | plug-in hybrid | flex fuel | other | null\n"
-        "- body_type: sedan | suv | truck | coupe | hatchback | wagon | van | minivan | "
+        "- type (body): sedan | suv | truck | coupe | hatchback | wagon | van | minivan | "
         "convertible | other | null\n"
+        "- drive: fwd | rwd | awd | 4wd | other | null\n"
         "- title_status: clean | rebuilt | salvage | lien | parts only | missing | other | null\n"
         "- condition: like new | excellent | good | fair | poor | project | other | null\n"
-        "- exterior_color: plain English color phrase ONLY if clearly stated (e.g. silver, black); "
-        "otherwise null\n"
-        "Integers: price (USD), year (4-digit), mileage (miles). Use null if not explicit."
+        "- color: plain English if clearly stated; else null\n"
+        "- seller_type: dealer | private | other | null\n"
+        "- state: 2-letter USPS code if explicit; else null\n"
+        "Integers: price (USD), year (4-digit), mileage (miles), cylinders (count). null if unknown."
     )
 
-    prompt = f"{sys_instr}\n\nTEXT:\n{raw_text}"
+    prompt = f"{sys_instr}\n\nREGEX_HINTS_JSON:\n{hints_json}\n\nTEXT:\n{raw_text}"
 
     gen_cfg = GenerationConfig(
-        # FIX: system_instruction removed to fix TypeError 
         temperature=0.0,
         top_p=1.0,
         top_k=40,
@@ -346,44 +516,29 @@ def _vertex_extract_fields(raw_text: str) -> dict:
         response_schema=schema,
     )
 
-    # --- LLM CALL WITH RETRY ---
     max_attempts = 3
     resp = None
     for attempt in range(max_attempts):
         try:
-            # Pass the single string prompt
             resp = model.generate_content(prompt, generation_config=gen_cfg)
             break
         except Exception as e:
-            # Includes the 404/NotFound error from the previous run
             if not _if_llm_retryable(e) or attempt == max_attempts - 1:
                 logging.error(f"Fatal/non-retryable LLM error or max retries reached: {e}")
                 raise
-            
+
             sleep_time = LLM_RETRY._calculate_sleep(attempt)
-            logging.warning(f"Transient LLM error on attempt {attempt+1}/{max_attempts}. Retrying in {sleep_time:.2f}s...")
+            logging.warning(
+                f"Transient LLM error on attempt {attempt+1}/{max_attempts}. Retrying in {sleep_time:.2f}s..."
+            )
             time.sleep(sleep_time)
 
     if resp is None:
         raise RuntimeError("LLM call failed after all retries.")
 
     parsed = json.loads(resp.text)
-
-    # Numeric cleanup
-    parsed["price"] = _safe_int(parsed.get("price"))
-    parsed["year"] = _safe_int(parsed.get("year"))
-    parsed["mileage"] = _safe_int(parsed.get("mileage"))
-
-    parsed["make"] = _norm_make(_optional_str(parsed.get("make")))
-    parsed["model"] = _norm_model(parsed.get("model"))
-    parsed["transmission"] = _normalize_transmission(parsed.get("transmission"))
-    parsed["fuel"] = _normalize_fuel(parsed.get("fuel"))
-    parsed["body_type"] = _normalize_body_type(parsed.get("body_type"))
-    parsed["exterior_color"] = _normalize_exterior_color(parsed.get("exterior_color"))
-    parsed["title_status"] = _normalize_title_status(parsed.get("title_status"))
-    parsed["condition"] = _normalize_condition(parsed.get("condition"))
-
-    return parsed
+    parsed = _postprocess_llm_dict(parsed)
+    return _merge_llm_and_regex(parsed, regex_hints, raw_text)
 
 
 # -------------------- HTTP ENTRY --------------------
@@ -454,28 +609,17 @@ def llm_extract_http(request: Request):
                 skipped += 1
                 continue
 
-            # Fetch the raw listing TXT; send to LLM
+            # Fetch the raw listing TXT; send to LLM (regex hints from jsonl row)
             raw_listing = _download_text(source_txt_key)
+            hints = _regex_hints_from_record(base_rec)
+            merged = _vertex_extract_fields(raw_listing, hints)
 
-            parsed = _vertex_extract_fields(raw_listing)
-
-            # Compose final record
             out_record = {
                 "post_id": post_id,
                 "run_id": base_rec.get("run_id", run_id),
                 "scraped_at": base_rec.get("scraped_at", structured_iso),
                 "source_txt": source_txt_key,
-                "price": parsed.get("price"),
-                "year": parsed.get("year"),
-                "make": parsed.get("make"),
-                "model": parsed.get("model"),
-                "mileage": parsed.get("mileage"),
-                "transmission": parsed.get("transmission"),
-                "fuel": parsed.get("fuel"),
-                "body_type": parsed.get("body_type"),
-                "exterior_color": parsed.get("exterior_color"),
-                "title_status": parsed.get("title_status"),
-                "condition": parsed.get("condition"),
+                **{k: merged.get(k) for k in OUTPUT_FIELD_KEYS},
                 "llm_provider": "vertex",
                 "llm_model": LLM_MODEL,
                 "llm_ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -490,7 +634,7 @@ def llm_extract_http(request: Request):
 
     result = {
         "ok": True,
-        "version": "extractor-llm-poc",
+        "version": "extractor-llm-v2-hybrid-schema",
         "run_id": run_id,
         "processed": processed,
         "written": written,
