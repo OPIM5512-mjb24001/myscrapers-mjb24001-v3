@@ -50,7 +50,7 @@ Each training run (not dry run) writes to `gs://<bucket>/structured/model_runs/<
 | `model_info.json` | Feature lists, params, data key |
 | `metrics_history.csv` | Snapshot of cumulative history (also appended to `structured/model_runs/metrics_history.csv`) |
 
-## Repo `results/` layout (grading / notebook)
+## Repo `results/` layout 
 
 Synced artifacts land **only** in these subfolders (no new files committed to `results/` root):
 
