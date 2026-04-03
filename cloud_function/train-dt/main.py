@@ -1,5 +1,6 @@
 # Time-aware training: train on all local dates before latest; hold out latest day.
-# Tuned RandomForestRegressor + artifacts under structured/model_runs/<run_id>/
+# Tuned tree ensemble (RandomForest vs ExtraTrees) + artifacts under structured/model_runs/<run_id>/
+# Target: log1p(price); metrics and predictions on original dollar scale.
 # HTTP entrypoint: train_dt_http
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import os
 import re
 import traceback
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import matplotlib
 
@@ -21,10 +22,10 @@ import numpy as np
 import pandas as pd
 from google.cloud import storage
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import PartialDependenceDisplay, permutation_importance
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import make_scorer, mean_absolute_error, mean_squared_error
 from sklearn.model_selection import ParameterSampler
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
@@ -40,7 +41,16 @@ TIMEZONE = os.getenv("TIMEZONE", "America/New_York")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 RARE_CAT_MIN_COUNT = int(os.getenv("RARE_CAT_MIN_COUNT", "5"))
 
+# Conservative listing filters (dollar scale)
+MIN_PRICE = float(os.getenv("MIN_PRICE_USD", "500"))
+MAX_PRICE = float(os.getenv("MAX_PRICE_USD", "500000"))
+MIN_MODEL_YEAR = int(os.getenv("MIN_MODEL_YEAR", "1980"))
+MAX_MILEAGE = float(os.getenv("MAX_MILEAGE", "999999"))
+
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+
+TARGET_ORIGINAL = "price_num"
+TARGET_LOG = "log_price_num"
 
 
 def _read_csv_from_gcs(client: storage.Client, bucket: str, key: str) -> pd.DataFrame:
@@ -88,6 +98,73 @@ def _bucket_rare_categories(df: pd.DataFrame, cols: list[str], min_count: int) -
     return out
 
 
+def _apply_training_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Conservative row filters; logs counts per rule in returned stats."""
+    stats: dict[str, Any] = {"input_rows": int(len(df))}
+    d = df.copy()
+    n0 = len(d)
+
+    m = d[TARGET_ORIGINAL].notna() & (d[TARGET_ORIGINAL] > 0)
+    stats["dropped_missing_or_nonpositive_price"] = int(n0 - m.sum())
+    d = d.loc[m]
+    n1 = len(d)
+
+    m = (d[TARGET_ORIGINAL] >= MIN_PRICE) & (d[TARGET_ORIGINAL] <= MAX_PRICE)
+    stats["dropped_extreme_price"] = int(n1 - m.sum())
+    d = d.loc[m]
+    n2 = len(d)
+
+    ref_year = d["scraped_at_local"].dt.year
+    yn = d["year_num"]
+    m = yn.notna() & (yn >= MIN_MODEL_YEAR) & (yn <= ref_year + 1)
+    stats["dropped_bad_year"] = int(n2 - m.sum())
+    d = d.loc[m]
+    n3 = len(d)
+
+    mi = d["mileage_num"]
+    m_ok = mi.isna() | ((mi >= 0) & (mi <= MAX_MILEAGE))
+    stats["dropped_bad_mileage"] = int(n3 - m_ok.sum())
+    d = d.loc[m_ok]
+    n4 = len(d)
+
+    if "title_status" in d.columns:
+        ts = d["title_status"].astype(str).str.lower().str.strip()
+        bad_titles = {"salvage", "parts only", "parts-only", "missing"}
+        bad = (
+            ts.isin(bad_titles)
+            | ts.isin(["", "nan", "none"])
+            | ts.str.contains("salvage", na=False)
+            | (ts.str.contains("parts", na=False) & ts.str.contains("only", na=False))
+        )
+        stats["dropped_title_status_nonstandard"] = int(bad.sum())
+        d = d.loc[~bad]
+    else:
+        stats["dropped_title_status_nonstandard"] = 0
+    n5 = len(d)
+
+    if "condition" in d.columns:
+        cond = d["condition"].astype(str).str.lower().str.strip()
+        bad = cond == "project"
+        stats["dropped_condition_project"] = int(bad.sum())
+        d = d.loc[~bad]
+    else:
+        stats["dropped_condition_project"] = 0
+
+    stats["output_rows"] = int(len(d))
+    stats["rows_removed_total"] = int(stats["input_rows"] - stats["output_rows"])
+    pct = (100.0 * stats["rows_removed_total"] / stats["input_rows"]) if stats["input_rows"] else 0.0
+    stats["pct_rows_removed"] = round(pct, 2)
+    logging.info(
+        "Row filtering: in=%d out=%d removed=%d (%.2f%%) detail=%s",
+        stats["input_rows"],
+        stats["output_rows"],
+        stats["rows_removed_total"],
+        pct,
+        {k: stats[k] for k in stats if k.startswith("dropped_")},
+    )
+    return d, stats
+
+
 def _mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -105,10 +182,20 @@ def _bias(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.mean(y_pred - y_true))
 
 
+def _dollar_mae_from_log(y_log_true: np.ndarray, y_log_pred: np.ndarray) -> float:
+    return float(mean_absolute_error(np.expm1(y_log_true), np.expm1(y_log_pred)))
+
+
+dollar_mae_scorer = make_scorer(
+    lambda y_true_log, y_pred_log: -mean_absolute_error(np.expm1(y_true_log), np.expm1(y_pred_log)),
+    greater_is_better=True,
+)
+
+
 def _build_preprocess_and_model(
     cat_cols: list[str],
     num_cols: list[str],
-    rf_params: dict[str, Any],
+    regressor,
 ) -> Pipeline:
     pre = ColumnTransformer(
         transformers=[
@@ -125,23 +212,18 @@ def _build_preprocess_and_model(
             ),
         ]
     )
-    rf = RandomForestRegressor(
-        random_state=42,
-        n_jobs=-1,
-        **rf_params,
-    )
-    return Pipeline([("pre", pre), ("model", rf)])
+    return Pipeline([("pre", pre), ("model", regressor)])
 
 
-def _dt_baseline_mae(
+def _dt_baseline_mae_dollars(
     X_train: pd.DataFrame,
-    y_train: pd.Series,
+    y_log_train: pd.Series,
     X_val: pd.DataFrame,
-    y_val: pd.Series,
+    y_log_val: pd.Series,
     cat_cols: list[str],
     num_cols: list[str],
 ) -> float | None:
-    if X_val.empty or not y_val.notna().any():
+    if X_val.empty or not y_log_val.notna().any():
         return None
     pre = ColumnTransformer(
         transformers=[
@@ -162,13 +244,49 @@ def _dt_baseline_mae(
         [("pre", pre), ("model", DecisionTreeRegressor(max_depth=8, min_samples_leaf=10, random_state=42))]
     )
     try:
-        m_tr = y_train.notna()
-        m_va = y_val.notna()
-        pipe.fit(X_train.loc[m_tr], y_train.loc[m_tr])
-        pred = pipe.predict(X_val.loc[m_va])
-        return float(mean_absolute_error(y_val.loc[m_va], pred))
+        m_tr = y_log_train.notna()
+        m_va = y_log_val.notna()
+        pipe.fit(X_train.loc[m_tr], y_log_train.loc[m_tr])
+        pred_log = pipe.predict(X_val.loc[m_va])
+        return _dollar_mae_from_log(y_log_val.loc[m_va].values.astype(float), pred_log)
     except Exception:
         return None
+
+
+def _tune_ensemble(
+    name: str,
+    build_reg: Callable[[dict[str, Any]], Any],
+    param_grid: dict[str, list],
+    X_tr: pd.DataFrame,
+    y_log_tr: pd.Series,
+    X_va: pd.DataFrame,
+    y_log_va: pd.Series,
+    cat_cols: list[str],
+    num_cols: list[str],
+    default_params: dict[str, Any],
+    n_iter: int = 12,
+) -> tuple[dict[str, Any], float]:
+    best_mae = float("inf")
+    best_params: dict[str, Any] = {}
+    for params in ParameterSampler(param_grid, n_iter=n_iter, random_state=42):
+        p = dict(params)
+        try:
+            reg = build_reg(p)
+            pipe = _build_preprocess_and_model(cat_cols, num_cols, reg)
+            pipe.fit(X_tr, y_log_tr)
+            pred_log = pipe.predict(X_va)
+            m_va = y_log_va.notna()
+            if not m_va.any():
+                continue
+            mae = _dollar_mae_from_log(y_log_va.loc[m_va].values.astype(float), pred_log[m_va.to_numpy()])
+            if mae < best_mae:
+                best_mae = mae
+                best_params = {k: v for k, v in p.items()}
+        except Exception as ex:
+            logging.warning("Tune iteration failed (%s): %s", name, ex)
+    if not best_params or not np.isfinite(best_mae):
+        return dict(default_params), float("nan")
+    return best_params, best_mae
 
 
 def run_once(dry_run: bool = False) -> dict[str, Any]:
@@ -188,7 +306,7 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         df["scraped_at_local"] = df["scraped_at_dt_utc"]
     df["date_local"] = df["scraped_at_local"].dt.date
 
-    df["price_num"] = _clean_numeric(df["price"])
+    df[TARGET_ORIGINAL] = _clean_numeric(df["price"])
     df["year_num"] = _clean_numeric(df["year"])
     df["mileage_num"] = _clean_numeric(df.get("mileage", pd.Series(index=df.index)))
 
@@ -225,9 +343,13 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
     else:
         df["cylinders"] = np.nan
 
+    df, filter_stats = _apply_training_filters(df)
+
+    df[TARGET_LOG] = np.log1p(df[TARGET_ORIGINAL].astype(float))
+
     orig_rows = len(df)
-    valid_price_rows = int(df["price_num"].notna().sum())
-    logging.info("Rows total=%d | valid price=%d", orig_rows, valid_price_rows)
+    valid_price_rows = int(df[TARGET_ORIGINAL].notna().sum())
+    logging.info("Rows after filters total=%d | valid price=%d", orig_rows, valid_price_rows)
 
     unique_dates = sorted(d for d in df["date_local"].dropna().unique())
     if len(unique_dates) < 2:
@@ -240,13 +362,13 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
     today_local = unique_dates[-1]
     train_df = df[df["date_local"] < today_local].copy()
     holdout_df = df[df["date_local"] == today_local].copy()
-    train_df = train_df[train_df["price_num"].notna()]
+    train_df = train_df[train_df[TARGET_ORIGINAL].notna()]
 
     if len(train_df) < 40:
         return {"status": "noop", "reason": "too few training rows", "train_rows": int(len(train_df))}
 
-    target = "price_num"
-    num_cols = ["vehicle_age", "log_mileage", "year_num", "mileage_num", "cylinders"]
+    # Simplified numerics: vehicle_age + log_mileage (+ cylinders); drop redundant year_num / mileage_num
+    num_cols = ["vehicle_age", "log_mileage", "cylinders"]
     num_cols = [c for c in num_cols if c in train_df.columns]
     cat_cols = [
         "make",
@@ -268,58 +390,105 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d%H")
     run_prefix = f"{MODEL_RUN_PREFIX}/{run_id}"
 
-    # --- Date-aware tuning: train < val_day < today_local ---
-    best_params: dict[str, Any] = {
-        "n_estimators": 200,
-        "max_depth": 20,
-        "min_samples_leaf": 4,
-        "max_features": "sqrt",
+    param_grid_shared: dict[str, list] = {
+        "n_estimators": [100, 200, 300],
+        "max_depth": [12, 20, 28, None],
+        "min_samples_leaf": [1, 2, 4, 8],
+        "max_features": ["sqrt", 0.3, 0.5],
     }
+
+    default_rf = {"n_estimators": 200, "max_depth": 20, "min_samples_leaf": 4, "max_features": "sqrt"}
+    best_rf_params = dict(default_rf)
+    best_et_params = dict(default_rf)
     tune_note = "defaults"
+    rf_tune_val_mae = float("nan")
+    et_tune_val_mae = float("nan")
 
     if len(unique_dates) >= 3:
         val_local = unique_dates[-2]
         tune_train = train_df[train_df["date_local"] < val_local]
         tune_val = train_df[train_df["date_local"] == val_local]
         if len(tune_train) >= 40 and len(tune_val) >= 5:
-            X_tr, y_tr = tune_train[feats], tune_train[target]
-            X_va, y_va = tune_val[feats], tune_val[target]
-            param_grid = {
-                "n_estimators": [100, 200, 300],
-                "max_depth": [12, 20, 28, None],
-                "min_samples_leaf": [1, 2, 4, 8],
-                "max_features": ["sqrt", 0.3, 0.5],
-            }
-            best_mae = float("inf")
-            for params in ParameterSampler(param_grid, n_iter=12, random_state=42):
-                pipe = _build_preprocess_and_model(cat_cols, num_cols, params)
-                try:
-                    pipe.fit(X_tr, y_tr)
-                    pred = pipe.predict(X_va)
-                    m_va = y_va.notna()
-                    if not m_va.any():
-                        continue
-                    m = mean_absolute_error(y_va.loc[m_va], pred[m_va.to_numpy()])
-                    if m < best_mae:
-                        best_mae = m
-                        best_params = dict(params)
-                except Exception as ex:
-                    logging.warning("Tune iteration failed: %s", ex)
-            tune_note = f"val_date={val_local} best_mae={best_mae:.2f}"
-            logging.info("Tuning done: %s params=%s", tune_note, best_params)
+            X_tr, y_tr = tune_train[feats], tune_train[TARGET_LOG]
+            X_va, y_va = tune_val[feats], tune_val[TARGET_LOG]
 
+            def build_rf(p: dict) -> RandomForestRegressor:
+                return RandomForestRegressor(random_state=42, n_jobs=-1, **p)
+
+            def build_et(p: dict) -> ExtraTreesRegressor:
+                return ExtraTreesRegressor(random_state=42, n_jobs=-1, bootstrap=False, **p)
+
+            best_rf_params, rf_tune_val_mae = _tune_ensemble(
+                "RandomForest",
+                build_rf,
+                param_grid_shared,
+                X_tr,
+                y_tr,
+                X_va,
+                y_va,
+                cat_cols,
+                num_cols,
+                default_rf,
+            )
+            best_et_params, et_tune_val_mae = _tune_ensemble(
+                "ExtraTrees",
+                build_et,
+                param_grid_shared,
+                X_tr,
+                y_tr,
+                X_va,
+                y_va,
+                cat_cols,
+                num_cols,
+                default_rf,
+            )
+            tune_note = (
+                f"val_date={val_local} rf_tune_mae_dollars={rf_tune_val_mae:.2f} "
+                f"et_tune_mae_dollars={et_tune_val_mae:.2f}"
+            )
+            logging.info("Tuning done: %s rf_params=%s et_params=%s", tune_note, best_rf_params, best_et_params)
+
+    # Select model by tune validation dollar MAE (lower wins); tie-break RF
+    if np.isfinite(rf_tune_val_mae) and np.isfinite(et_tune_val_mae):
+        if et_tune_val_mae < rf_tune_val_mae - 1e-9:
+            chosen_name = "ExtraTreesRegressor"
+            chosen_params = best_et_params
+            chosen_build = lambda p: ExtraTreesRegressor(random_state=42, n_jobs=-1, bootstrap=False, **p)
+        else:
+            chosen_name = "RandomForestRegressor"
+            chosen_params = best_rf_params
+            chosen_build = lambda p: RandomForestRegressor(random_state=42, n_jobs=-1, **p)
+    elif np.isfinite(et_tune_val_mae):
+        chosen_name = "ExtraTreesRegressor"
+        chosen_params = best_et_params
+        chosen_build = lambda p: ExtraTreesRegressor(random_state=42, n_jobs=-1, bootstrap=False, **p)
+    elif np.isfinite(rf_tune_val_mae):
+        chosen_name = "RandomForestRegressor"
+        chosen_params = best_rf_params
+        chosen_build = lambda p: RandomForestRegressor(random_state=42, n_jobs=-1, **p)
+    else:
+        chosen_name = "RandomForestRegressor"
+        chosen_params = best_rf_params
+        chosen_build = lambda p: RandomForestRegressor(random_state=42, n_jobs=-1, **p)
+
+    reg_final = chosen_build(chosen_params)
+    pipe = _build_preprocess_and_model(cat_cols, num_cols, reg_final)
     X_train = train_df[feats]
-    y_train = train_df[target]
-    pipe = _build_preprocess_and_model(cat_cols, num_cols, best_params)
-    pipe.fit(X_train, y_train)
+    y_train_log = train_df[TARGET_LOG]
+    pipe.fit(X_train, y_train_log)
 
     baseline_mae = None
     if len(unique_dates) >= 3:
         val_local = unique_dates[-2]
         tune_train = train_df[train_df["date_local"] < val_local]
         tune_val = train_df[train_df["date_local"] == val_local]
-        baseline_mae = _dt_baseline_mae(
-            tune_train[feats], tune_train[target], tune_val[feats], tune_val[target], cat_cols, num_cols
+        baseline_mae = _dt_baseline_mae_dollars(
+            tune_train[feats],
+            tune_train[TARGET_LOG],
+            tune_val[feats],
+            tune_val[TARGET_LOG],
+            cat_cols,
+            num_cols,
         )
 
     mae_today = mape_today = rmse_today = bias_today = None
@@ -329,15 +498,16 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
 
     if not holdout_df.empty:
         X_h = holdout_df[feats]
-        y_hat = pipe.predict(X_h)
+        y_hat_log = pipe.predict(X_h)
+        y_hat = np.expm1(y_hat_log)
 
         preds_df = pd.DataFrame(
             {
                 "post_id": holdout_df.get("post_id", pd.Series(index=holdout_df.index)),
                 "scraped_at": holdout_df["scraped_at"],
-                "actual_price": holdout_df["price_num"],
+                "actual_price": holdout_df[TARGET_ORIGINAL],
                 "pred_price": np.round(y_hat, 2),
-                "residual": np.round(y_hat - holdout_df["price_num"].values, 2),
+                "residual": np.round(y_hat - holdout_df[TARGET_ORIGINAL].values, 2),
                 "make": holdout_df.get("make"),
                 "model": holdout_df.get("model"),
                 "year": holdout_df.get("year"),
@@ -345,26 +515,26 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
             }
         )
 
-        mask = holdout_df["price_num"].notna()
+        mask = holdout_df[TARGET_ORIGINAL].notna()
         if mask.any():
-            yt = holdout_df.loc[mask, "price_num"].values.astype(float)
+            yt = holdout_df.loc[mask, TARGET_ORIGINAL].values.astype(float)
             yp = y_hat[mask.to_numpy()]
             mae_today = float(mean_absolute_error(yt, yp))
             mape_today = _mape(yt, yp)
             rmse_today = _rmse(yt, yp)
             bias_today = _bias(yt, yp)
 
-        # Permutation importance on holdout rows with known price
         try:
-            m_perm = holdout_df["price_num"].notna()
+            m_perm = holdout_df[TARGET_ORIGINAL].notna()
             if m_perm.any():
+                y_perm_log = holdout_df.loc[m_perm, TARGET_LOG].values
                 r = permutation_importance(
                     pipe,
                     X_h.loc[m_perm],
-                    holdout_df.loc[m_perm, target],
+                    y_perm_log,
                     n_repeats=15,
                     random_state=42,
-                    scoring="neg_mean_absolute_error",
+                    scoring=dollar_mae_scorer,
                     n_jobs=-1,
                 )
                 names = np.array(feats)
@@ -379,6 +549,19 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         except Exception as ex:
             logging.warning("permutation_importance failed: %s", ex)
 
+    model_comparison = {
+        "random_forest": {
+            "tune_val_mae_dollars": rf_tune_val_mae if np.isfinite(rf_tune_val_mae) else None,
+            "best_params": best_rf_params,
+        },
+        "extra_trees": {
+            "tune_val_mae_dollars": et_tune_val_mae if np.isfinite(et_tune_val_mae) else None,
+            "best_params": best_et_params,
+        },
+        "selected": chosen_name,
+        "selection_rule": "lower tune validation MAE on original dollar scale (second-to-last local date)",
+    }
+
     metrics = {
         "run_id": run_id,
         "timezone": TIMEZONE,
@@ -391,22 +574,37 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         "bias": bias_today,
         "baseline_dt_mae_tune_val": baseline_mae,
         "tuning": tune_note,
-        "best_rf_params": best_params,
+        "best_rf_params": best_rf_params,
+        "best_extra_trees_params": best_et_params,
+        "chosen_model": chosen_name,
+        "chosen_model_params": chosen_params,
+        "model_comparison": model_comparison,
+        "target_transform": f"log1p({TARGET_ORIGINAL})",
+        "metrics_scale": "original_usd (expm1 predictions vs actual price_num)",
+        "filtering": filter_stats,
         "data_key": DATA_KEY,
-        "model": "RandomForestRegressor",
+        "model": chosen_name,
     }
 
     model_info = {
         "run_id": run_id,
         "data_key": DATA_KEY,
-        "target": target,
+        "target": TARGET_ORIGINAL,
+        "target_training": TARGET_LOG,
+        "target_transform": "log1p(price_num); predictions back-transformed with numpy.expm1",
         "features": feats,
         "categorical_features": cat_cols,
         "numeric_features": num_cols,
+        "feature_notes": "vehicle_age and log_mileage only (year_num and mileage_num omitted as redundant)",
         "timezone": TIMEZONE,
         "eval_date_local": str(today_local),
-        "random_forest_params": best_params,
-        "pipeline": "ColumnTransformer(SimpleImputer+OneHotEncoder) -> RandomForestRegressor",
+        "random_forest_params": best_rf_params,
+        "extra_trees_params": best_et_params,
+        "chosen_model": chosen_name,
+        "chosen_model_params": chosen_params,
+        "model_comparison": model_comparison,
+        "filtering": filter_stats,
+        "pipeline": f"ColumnTransformer(SimpleImputer+OneHotEncoder) -> {chosen_name}",
         "tuning_note": tune_note,
     }
 
@@ -453,7 +651,6 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
                 "text/csv",
             )
 
-        # PDPs for top 3 features (by permutation importance)
         for i, fname in enumerate(top_features[:3], start=1):
             try:
                 if fname not in X_h.columns:
@@ -465,7 +662,7 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
                     features=[fname],
                     ax=ax,
                 )
-                ax.set_title(f"PDP: {fname}")
+                ax.set_title(f"PDP: {fname} (log target)")
                 fig.tight_layout()
                 buf = io.BytesIO()
                 fig.savefig(buf, format="png", dpi=120)
@@ -486,10 +683,8 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
             GCS_BUCKET,
             f"{run_prefix}/model_info.json",
             json.dumps(model_info, indent=2, default=str),
-            "application/json",
         )
 
-        # Append cumulative metrics history (single CSV blob)
         hist_row = {
             "run_id": run_id,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -501,7 +696,7 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
             "train_rows": len(train_df),
             "holdout_rows": len(holdout_df),
             "data_key": DATA_KEY,
-            "model": "RandomForestRegressor",
+            "model": chosen_name,
         }
         prev = _read_text_from_gcs(client, GCS_BUCKET, METRICS_HISTORY_KEY)
         if prev:
@@ -519,7 +714,6 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
             hist.to_csv(index=False),
             "text/csv",
         )
-        # Copy snapshot into this run for sync convenience
         _write_text_to_gcs(
             client,
             GCS_BUCKET,
