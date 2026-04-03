@@ -1,6 +1,6 @@
 # Craigslist car listings — ETL, LLM enrichment, and price model (Mid Term Project)
 
-Mid term project pipeline that scrapes Craigslist car listings (scraper **unchanged** in this repo), extracts structured fields with **regex + Vertex Gemini**, materializes a master CSV, trains a **time-aware RandomForest** price model in GCP, and syncs **metrics, predictions, and interpretability artifacts** back to GitHub for analysis in a notebook.
+Mid term project pipeline that scrapes Craigslist car listings (scraper **unchanged** in this repo), extracts structured fields with **regex + Vertex Gemini**, materializes a master CSV, trains a **time-aware** price model (**RandomForest vs ExtraTrees**, **log1p** target, dollar metrics) in GCP, and syncs **metrics, predictions, and interpretability artifacts** back to GitHub for analysis in a notebook.
 
 ## Project overview
 
@@ -8,7 +8,7 @@ Mid term project pipeline that scrapes Craigslist car listings (scraper **unchan
 2. **Regex ETL**: `extractor-per-listing` → `structured/run_id=<run>/jsonl/<post_id>.jsonl`.
 3. **LLM ETL**: `extractor-llm-poc` reads each JSONL, downloads `source_txt`, merges regex hints with Gemini JSON → `jsonl_llm/<post_id>_llm.jsonl`.
 4. **Materialize**: `materialize-master-llm` dedupes by `post_id` (newest run wins) → **`structured/datasets/listings_master_llm.csv`** (canonical training table).
-5. **Train**: `train-dt` reads the LLM master CSV, trains on all **America/New_York** local dates before the latest day, holds out the latest day, tunes **RandomForestRegressor**, writes artifacts under **`structured/model_runs/<YYYYMMDDHH>/`**.
+5. **Train**: `train-dt` reads the LLM master CSV, trains on all **America/New_York** local dates before the latest day, holds out the latest day, tunes **RandomForest** and **ExtraTrees** (selects the better on the tune-validation day), fits on **log1p(price)** with **metrics and `predictions.csv` on original USD** (`expm1`), writes artifacts under **`structured/model_runs/<YYYYMMDDHH>/`**.
 6. **Sync**: GitHub Actions copies the latest run’s files into **`results/`** subfolders for grading and notebooks.
 
 ## What changed from the baseline
@@ -18,7 +18,7 @@ Mid term project pipeline that scrapes Craigslist car listings (scraper **unchan
 | Regex extract | price, year, make, model, mileage | + transmission, color, drive, fuel, condition, title_status, type, cylinders, seller_type, city, state, zip (when explicit) |
 | LLM extract | Few fields; `body_type` / `exterior_color` | Full rubric schema; `type` / `color`; location + zip rules; hybrid merge with regex |
 | Master CSV | Narrow columns | Full enriched schema (see below) |
-| Model | Single decision tree, MAE only | Tuned **RandomForest**, MAE / MAPE / RMSE / Bias, permutation importance, PDPs |
+| Model | Single decision tree, MAE only | Tuned **RandomForest vs ExtraTrees** (best wins), **log1p(price)** training with dollar-scale metrics, MAE / MAPE / RMSE / Bias, permutation importance, PDPs |
 | Artifacts | `structured/preds/.../preds.csv` only | `structured/model_runs/<id>/` (+ cumulative `metrics_history.csv`) |
 | Sync | Flat `results/*-preds.csv` (legacy) | `results/{predictions,metrics,...}` + legacy files in `archive/legacy_predictions/` |
 
@@ -31,10 +31,12 @@ Column order in **`listings_master_llm.csv`**:
 ## Modeling approach
 
 - **Split**: `scraped_at` → UTC → **America/New_York** local date. Train on all rows with `date_local < max(date_local)`; evaluate on the latest local date (“today” in the dataset).
-- **Features**: categoricals (make, model, transmission, fuel, drive, condition, title_status, type, seller_type, state, city, `zip_prefix`) with imputation + one-hot encoding; numeric `vehicle_age` (clipped), `log_mileage`, `year_num`, `mileage_num`, `cylinders`; rare levels bucketed for sparse categories.
-- **Tuning**: When ≥3 distinct dates exist, **ParameterSampler** over a small hyperparameter grid, validated on the **second-to-last** local date (date-aware, not random K-fold).
-- **Baselines**: Optional decision tree MAE on the same tune split (logged in `metrics.json`).
-- **Final model**: **RandomForestRegressor** with best params from that search.
+- **Target**: Train on **`log1p(price_num)`**; predictions in `predictions.csv` and error metrics (MAE, MAPE, RMSE, bias) use **original dollars** after **`numpy.expm1`** on model outputs. Documented in `model_info.json` (`target`, `target_training`, `target_transform`).
+- **Row filters (conservative)**: Before splitting, rows are dropped for missing/non-positive price, extreme price (defaults **$500–$500,000**), implausible model year vs scrape year, impossible mileage, non-standard **title_status** (e.g. salvage, parts-only, missing/blank), and **condition == project**. Counts per rule are in `metrics.json` / `model_info.json` under **`filtering`**. Optional overrides: `MIN_PRICE_USD`, `MAX_PRICE_USD`, `MIN_MODEL_YEAR`, `MAX_MILEAGE`.
+- **Features**: categoricals (make, model, transmission, fuel, drive, condition, title_status, type, seller_type, state, city, `zip_prefix`) with imputation + one-hot encoding; numeric **`vehicle_age` (clipped), `log_mileage`, `cylinders`** (raw `year_num` / `mileage_num` omitted as redundant with age / log mileage); rare levels bucketed for sparse categories.
+- **Tuning**: When ≥3 distinct dates exist, **ParameterSampler** over a small hyperparameter grid for **both** `RandomForestRegressor` and `ExtraTreesRegressor`, validated on the **second-to-last** local date using **dollar MAE** (not random K-fold).
+- **Baselines**: Optional decision tree MAE on the same tune split in dollar space (logged in `metrics.json`).
+- **Final model**: The ensemble with **lower tune-validation dollar MAE**; tie-break **Random Forest**. Stored as `chosen_model` / `model` in `metrics.json` and `metrics_history.csv`.
 
 ## Artifact outputs (GCS)
 
@@ -43,11 +45,11 @@ Each training run (not dry run) writes to `gs://<bucket>/structured/model_runs/<
 | File | Description |
 |------|-------------|
 | `predictions.csv` | `post_id`, `scraped_at`, `actual_price`, `pred_price`, `residual`, make/model/year/mileage |
-| `metrics.json` | MAE, MAPE, RMSE, bias, row counts, tuning notes, RF params |
+| `metrics.json` | MAE, MAPE, RMSE, bias, row counts, tuning notes, RF + ExtraTrees params, `chosen_model`, `filtering`, `target_transform`, `model_comparison` |
 | `metrics.csv` | Same metrics in one row |
 | `permutation_importance.csv` | All input features, mean/std importance on holdout |
 | `pdp/pdp_top*.png` | Partial dependence plots for top 3 features by importance |
-| `model_info.json` | Feature lists, params, data key |
+| `model_info.json` | Feature lists, chosen + both ensembles’ params, data key, log-target notes, filtering summary |
 | `metrics_history.csv` | Snapshot of cumulative history (also appended to `structured/model_runs/metrics_history.csv`) |
 
 ## Repo `results/` layout 
