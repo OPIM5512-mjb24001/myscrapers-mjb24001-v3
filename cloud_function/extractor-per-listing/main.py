@@ -219,6 +219,21 @@ def _extract_zip_regex(text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _finalize_zip_for_submission(zip_code: str | None, state: str | None) -> str | None:
+    """
+    Keep zip_code as a 5-character digit string only when valid.
+    Conservative: if state is CT, USPS ZIPs are 06xxx — null mismatches (bad geography).
+    """
+    if not zip_code:
+        return None
+    z = re.sub(r"\D", "", str(zip_code).strip())
+    if len(z) != 5 or not z.isdigit():
+        return None
+    if state == "CT" and not z.startswith("06"):
+        return None
+    return z
+
+
 def _extract_state_city_regex(text: str) -> tuple[str | None, str | None]:
     """
     Heuristic: 'City, ST' or 'ST' two-letter state near location lines.
@@ -346,14 +361,14 @@ def parse_listing(text: str) -> dict:
         d["seller_type"] = seller
 
     z = _extract_zip_regex(text)
-    if z:
-        d["zip_code"] = z
-
     cty, st = _extract_state_city_regex(text)
     if cty:
         d["city"] = cty
     if st:
         d["state"] = st
+    zf = _finalize_zip_for_submission(z, st)
+    if zf:
+        d["zip_code"] = zf
 
     return d
 

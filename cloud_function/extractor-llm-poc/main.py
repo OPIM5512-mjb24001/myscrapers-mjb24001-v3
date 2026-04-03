@@ -202,10 +202,10 @@ def _normalize_transmission(raw: str | None) -> str | None:
         return "automatic"
     if "manual" in low or "stick" in low or re.search(r"\b[45678]-speed\b", low):
         return "manual"
-    allowed = {"automatic", "manual", "cvt", "other"}
+    allowed = {"automatic", "manual", "cvt"}
     if low in allowed:
         return low
-    return "other"
+    return None
 
 
 def _normalize_fuel(raw: str | None) -> str | None:
@@ -224,12 +224,12 @@ def _normalize_fuel(raw: str | None) -> str | None:
         return "gas"
     if "diesel" in low:
         return "diesel"
-    if "flex" in low and "fuel" in low or "e85" in low:
+    if ("flex" in low and "fuel" in low) or "e85" in low:
         return "flex fuel"
-    allowed = {"gas", "diesel", "hybrid", "electric", "plug-in hybrid", "flex fuel", "other"}
+    allowed = {"gas", "diesel", "hybrid", "electric", "plug-in hybrid", "flex fuel"}
     if low in allowed:
         return low
-    return "other"
+    return None
 
 
 def _normalize_type(raw: str | None) -> str | None:
@@ -244,11 +244,11 @@ def _normalize_type(raw: str | None) -> str | None:
         return "truck"
     allowed = {
         "sedan", "suv", "truck", "coupe", "hatchback", "wagon", "van",
-        "minivan", "convertible", "other",
+        "minivan", "convertible",
     }
     if low in allowed:
         return low
-    return "other"
+    return None
 
 
 def _normalize_drive(raw: str | None) -> str | None:
@@ -264,10 +264,11 @@ def _normalize_drive(raw: str | None) -> str | None:
         return "fwd"
     if "rwd" in low or "rearwheel" in low:
         return "rwd"
-    allowed = {"4wd", "awd", "fwd", "rwd", "other"}
-    if s.lower().strip() in allowed:
-        return s.lower().strip()
-    return "other"
+    allowed = {"4wd", "awd", "fwd", "rwd"}
+    stripped = s.lower().strip()
+    if stripped in allowed:
+        return stripped
+    return None
 
 
 def _normalize_state(raw: str | None) -> str | None:
@@ -298,10 +299,10 @@ def _normalize_seller_type(raw: str | None) -> str | None:
         return "dealer"
     if "private" in low or "owner" in low:
         return "private"
-    allowed = {"dealer", "private", "other"}
+    allowed = {"dealer", "private"}
     if low in allowed:
         return low
-    return "other"
+    return None
 
 
 def _validate_zip_in_text(zip_candidate: str | None, raw_text: str) -> str | None:
@@ -314,6 +315,20 @@ def _validate_zip_in_text(zip_candidate: str | None, raw_text: str) -> str | Non
     if re.search(rf"\b{z}\b", raw_text or ""):
         return z
     return None
+
+
+def _finalize_zip_for_submission(zip_code: str | None, state: str | None) -> str | None:
+    """
+    ZIP as a 5-digit string only. If state is CT, expect 06xxx (USPS); else drop inconsistent ZIP.
+    """
+    if not zip_code:
+        return None
+    z = re.sub(r"\D", "", str(zip_code).strip())
+    if len(z) != 5 or not z.isdigit():
+        return None
+    if state == "CT" and not z.startswith("06"):
+        return None
+    return z
 
 
 def _normalize_title_status(raw: str | None) -> str | None:
@@ -333,10 +348,10 @@ def _normalize_title_status(raw: str | None) -> str | None:
         return "parts only"
     if "missing" in low:
         return "missing"
-    allowed = {"clean", "rebuilt", "salvage", "lien", "parts only", "missing", "other"}
+    allowed = {"clean", "rebuilt", "salvage", "lien", "parts only", "missing"}
     if low in allowed:
         return low
-    return "other"
+    return None
 
 
 def _normalize_condition(raw: str | None) -> str | None:
@@ -352,10 +367,10 @@ def _normalize_condition(raw: str | None) -> str | None:
         return "project"
     if "like new" in low or low.replace("-", " ") == "like new":
         return "like new"
-    allowed = {"like new", "excellent", "good", "fair", "poor", "project", "other"}
+    allowed = {"like new", "excellent", "good", "fair", "poor", "project"}
     if low in allowed:
         return low
-    return "other"
+    return None
 
 
 def _normalize_color(raw: str | None) -> str | None:
@@ -403,7 +418,9 @@ def _postprocess_llm_dict(parsed: dict) -> dict:
         parsed["zip_code"] = None
     else:
         digits = re.sub(r"\D", "", str(zraw))
-        parsed["zip_code"] = digits[:5] if len(digits) >= 5 else None
+        if len(digits) >= 9:
+            digits = digits[:5]
+        parsed["zip_code"] = digits if len(digits) == 5 and digits.isdigit() else None
     parsed["seller_type"] = _normalize_seller_type(parsed.get("seller_type"))
     return parsed
 
@@ -437,6 +454,7 @@ def _merge_llm_and_regex(llm_norm: dict, regex_hints: dict, raw_text: str) -> di
         else:
             out[k] = rv if rv not in (None, "") else None
 
+    out["zip_code"] = _finalize_zip_for_submission(out.get("zip_code"), out.get("state"))
     return out
 
 
@@ -491,16 +509,17 @@ def _vertex_extract_fields(raw_text: str, regex_hints: dict) -> dict:
         "'Hartford, CT' or 'CT' near the title); otherwise null.\n"
         "REGEX_HINTS_JSON (from a separate regex pass; may be incomplete or wrong): "
         "prefer TEXT over hints when they conflict; use hints only to disambiguate when helpful.\n"
-        "Normalize categoricals when possible (lowercase labels):\n"
-        "- transmission: automatic | manual | cvt | other | null\n"
-        "- fuel: gas | diesel | hybrid | electric | plug-in hybrid | flex fuel | other | null\n"
+        "Normalize categoricals only when the TEXT clearly supports a label; otherwise null "
+        "(do not use a catch-all like 'other').\n"
+        "- transmission: automatic | manual | cvt | null\n"
+        "- fuel: gas | diesel | hybrid | electric | plug-in hybrid | flex fuel | null\n"
         "- type (body): sedan | suv | truck | coupe | hatchback | wagon | van | minivan | "
-        "convertible | other | null\n"
-        "- drive: fwd | rwd | awd | 4wd | other | null\n"
-        "- title_status: clean | rebuilt | salvage | lien | parts only | missing | other | null\n"
-        "- condition: like new | excellent | good | fair | poor | project | other | null\n"
+        "convertible | null\n"
+        "- drive: fwd | rwd | awd | 4wd | null\n"
+        "- title_status: clean | rebuilt | salvage | lien | parts only | missing | null\n"
+        "- condition: like new | excellent | good | fair | poor | project | null\n"
         "- color: plain English if clearly stated; else null\n"
-        "- seller_type: dealer | private | other | null\n"
+        "- seller_type: dealer | private | null\n"
         "- state: 2-letter USPS code if explicit; else null\n"
         "Integers: price (USD), year (4-digit), mileage (miles), cylinders (count). null if unknown."
     )

@@ -28,6 +28,8 @@ Column order in **`listings_master_llm.csv`**:
 
 `post_id`, `run_id`, `scraped_at`, `source_txt`, `price`, `year`, `make`, `model`, `mileage`, `transmission`, `color`, `city`, `state`, `zip_code`, `drive`, `fuel`, `condition`, `title_status`, `type`, `cylinders`, `seller_type`, `llm_provider`, `llm_model`, `llm_ts`
 
+**Enriched-field policy (submission-oriented):** `zip_code` is kept as a **5-digit string** when valid (leading zeros preserved end-to-end; invalid or geography-inconsistent values are nulled — e.g. CT listings only keep ZIPs in the **06xxx** USPS range). LLM and post-process steps **prefer null over guessed labels**: ambiguous fuel, title, condition, seller type, etc. are not mapped to a generic “other”. Training reads `zip_code` as text, builds **`zip_prefix` from the cleaned 5-digit string** only, and never relies on integer ZIPs.
+
 ## Modeling approach
 
 - **Split**: `scraped_at` → UTC → **America/New_York** local date. Train on all rows with `date_local < max(date_local)`; evaluate on the latest local date (“today” in the dataset).

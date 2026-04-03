@@ -84,6 +84,36 @@ def _jsonl_records_for_run(bucket: str, structured_prefix: str, run_id: str):
         except Exception:
             continue
 
+def _clean_zip_code_csv_value(val) -> str:
+    """
+    Emit ZIP as exactly five digits when valid; otherwise empty (NA in downstream reads).
+    Avoids float artifacts like 6001.0 -> a bogus 5-digit string from naive digit-stripping.
+    Leading zeros are preserved when present in the source string; ZIPs mangled as
+    ints (6001) cannot be recovered and are dropped (empty).
+    """
+    if val is None:
+        return ""
+    if isinstance(val, float):
+        if val != val:  # NaN
+            return ""
+        if abs(val - round(val)) >= 1e-9:
+            return ""
+        val = int(round(val))
+        raw = str(val)
+    else:
+        raw = str(val).strip()
+        if raw.lower() in ("nan", "none", ""):
+            return ""
+        if re.fullmatch(r"-?\d+\.0", raw):
+            raw = raw.split(".")[0].lstrip("-")
+    s = re.sub(r"\D", "", raw)
+    if len(s) >= 9:
+        s = s[:5]
+    if len(s) == 5 and s.isdigit():
+        return s
+    return ""
+
+
 def _run_id_to_dt(rid: str) -> datetime:
     if RUN_ID_ISO_RE.match(rid):
         return datetime.strptime(rid, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
@@ -107,6 +137,8 @@ def _write_csv(records: Iterable[Dict], dest_key: str, columns=CSV_COLUMNS) -> i
         w.writeheader()
         for rec in records:
             row = {c: rec.get(c, None) for c in columns}
+            z = _clean_zip_code_csv_value(rec.get("zip_code"))
+            row["zip_code"] = z if z else None
             w.writerow(row)
             n += 1
     return n  # close() finalizes the upload

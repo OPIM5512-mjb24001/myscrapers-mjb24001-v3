@@ -58,7 +58,48 @@ def _read_csv_from_gcs(client: storage.Client, bucket: str, key: str) -> pd.Data
     blob = b.blob(key)
     if not blob.exists():
         raise FileNotFoundError(f"gs://{bucket}/{key} not found")
-    return pd.read_csv(io.BytesIO(blob.download_as_bytes()))
+    buf = io.BytesIO(blob.download_as_bytes())
+    df = pd.read_csv(buf, low_memory=False)
+    if "zip_code" in df.columns:
+        df["zip_code"] = df["zip_code"].astype("string")
+    return df
+
+
+def _clean_zip_series(zip_s: pd.Series, state_s: pd.Series | None = None) -> pd.Series:
+    """
+    ZIP as 5-digit string; invalid / suspicious → NA. Never coerce via float/int.
+    CT listings: USPS ZIPs are 06xxx — drop mismatch (conservative geography).
+    """
+    if zip_s is None:
+        return pd.Series(pd.NA, dtype="string")
+    z = zip_s.astype("string")
+    z = z.replace({"<NA>": pd.NA})
+    stripped = z.str.strip()
+    stripped = stripped.mask(stripped.isin(["", "nan", "None", "<NA>"]), pd.NA)
+    stripped = stripped.str.replace(r"^(\d+)\.0$", r"\1", regex=True)
+    digits = stripped.str.replace(r"\D", "", regex=True)
+    long = digits.notna() & (digits.str.len() >= 9)
+    digits = digits.where(~long, digits.str.slice(0, 5))
+    ok = (
+        digits.notna()
+        & (digits.str.len() == 5)
+        & digits.str.fullmatch(r"\d{5}", na=False)
+    )
+    out = pd.Series(pd.NA, index=zip_s.index, dtype="string")
+    out = out.mask(ok, digits)
+    if state_s is not None and len(state_s) == len(out):
+        st = state_s.astype("string").str.upper().str.strip()
+        bad_ct = (st == "CT") & out.notna() & ~out.str.startswith("06", na=False)
+        out = out.mask(bad_ct, pd.NA)
+    return out
+
+
+def _zip_prefix_from_clean_zip(zip5: pd.Series) -> pd.Series:
+    """First three characters of validated 5-digit ZIP; missing ZIP → 'na' sentinel for the model."""
+    pref = pd.Series("na", index=zip5.index, dtype="object")
+    m = zip5.notna() & (zip5.str.len() == 5)
+    pref.loc[m] = zip5.loc[m].str.slice(0, 3)
+    return pref
 
 
 def _write_bytes_to_gcs(client: storage.Client, bucket: str, key: str, data: bytes, content_type: str):
@@ -314,9 +355,11 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
     df["vehicle_age"] = (ref_year - df["year_num"]).clip(lower=0, upper=80)
     df["log_mileage"] = np.log1p(df["mileage_num"].clip(lower=0).fillna(0))
 
-    z = df.get("zip_code", pd.Series(index=df.index)).astype(str).str.replace(r"\D", "", regex=True)
-    df["zip_prefix"] = z.str[:3].replace({"": np.nan, "nan": np.nan})
-    df["zip_prefix"] = df["zip_prefix"].fillna("na")
+    zip5 = _clean_zip_series(
+        df.get("zip_code", pd.Series(index=df.index, dtype="string")),
+        df["state"] if "state" in df.columns else None,
+    )
+    df["zip_prefix"] = _zip_prefix_from_clean_zip(zip5)
 
     for c in [
         "make",
