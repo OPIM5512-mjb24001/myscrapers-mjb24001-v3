@@ -1,0 +1,70 @@
+{
+  "run_id": "2026040321",
+  "timezone": "America/New_York",
+  "eval_date_local": "2026-04-03",
+  "train_rows": 195,
+  "holdout_rows": 271,
+  "mae": 4619.802941941682,
+  "mape": 54.64301043226592,
+  "rmse": 10265.736149621038,
+  "bias": -1354.676320171155,
+  "baseline_dt_mae_tune_val": 5980.719596753537,
+  "tuning": "val_date=2026-04-02 rf_tune_mae_dollars=4994.67 et_tune_mae_dollars=4220.92",
+  "best_rf_params": {
+    "n_estimators": 200,
+    "min_samples_leaf": 1,
+    "max_features": 0.5,
+    "max_depth": 28
+  },
+  "best_extra_trees_params": {
+    "n_estimators": 200,
+    "min_samples_leaf": 1,
+    "max_features": 0.5,
+    "max_depth": 28
+  },
+  "chosen_model": "ExtraTreesRegressor",
+  "chosen_model_params": {
+    "n_estimators": 200,
+    "min_samples_leaf": 1,
+    "max_features": 0.5,
+    "max_depth": 28
+  },
+  "model_comparison": {
+    "random_forest": {
+      "tune_val_mae_dollars": 4994.672960274568,
+      "best_params": {
+        "n_estimators": 200,
+        "min_samples_leaf": 1,
+        "max_features": 0.5,
+        "max_depth": 28
+      }
+    },
+    "extra_trees": {
+      "tune_val_mae_dollars": 4220.924231899764,
+      "best_params": {
+        "n_estimators": 200,
+        "min_samples_leaf": 1,
+        "max_features": 0.5,
+        "max_depth": 28
+      }
+    },
+    "selected": "ExtraTreesRegressor",
+    "selection_rule": "lower tune validation MAE on original dollar scale (second-to-last local date)"
+  },
+  "target_transform": "log1p(price_num)",
+  "metrics_scale": "original_usd (expm1 predictions vs actual price_num)",
+  "filtering": {
+    "input_rows": 510,
+    "dropped_missing_or_nonpositive_price": 15,
+    "dropped_extreme_price": 1,
+    "dropped_bad_year": 19,
+    "dropped_bad_mileage": 3,
+    "dropped_title_status_nonstandard": 4,
+    "dropped_condition_project": 2,
+    "output_rows": 466,
+    "rows_removed_total": 44,
+    "pct_rows_removed": 8.63
+  },
+  "data_key": "structured/datasets/listings_master_llm.csv",
+  "model": "ExtraTreesRegressor"
+}
