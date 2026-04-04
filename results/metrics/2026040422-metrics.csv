@@ -1,0 +1,2 @@
+run_id,eval_date_local,mae,mape,rmse,bias,model,target_strategy
+2026040422,2026-04-04,5794.24839564417,121.62914180109551,11318.552196524213,1117.0583826617942,HistGradientBoostingRegressor,raw
