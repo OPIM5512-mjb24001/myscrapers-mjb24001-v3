@@ -124,7 +124,7 @@ Older flat prediction files are kept under **`archive/legacy_predictions/`** for
 
 ## Notebook
 
-**[`notebooks/model_trending.ipynb`](notebooks/model_trending.ipynb)** is the main **grader-facing** summary.
+**[`notebooks/model_trending.ipynb`](notebooks/model_trending.ipynb)** is the main summary.
 
 - It does **not** retrain the pipeline and does **not** require **GCP** credentials.
 - It reads **synced repo artifacts only** and presents performance over time, **benchmark** comparison, final holdout **metrics**, **permutation importance**, the **top 3** PDPs, and a short written **interpretation**.
