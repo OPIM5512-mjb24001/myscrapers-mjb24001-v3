@@ -49,7 +49,7 @@ RARE_CAT_MIN_COUNT = int(os.getenv("RARE_CAT_MIN_COUNT", "5"))
 MIN_PRICE = float(os.getenv("MIN_PRICE_USD", "500"))
 MAX_PRICE = float(os.getenv("MAX_PRICE_USD", "500000"))
 MIN_MODEL_YEAR = int(os.getenv("MIN_MODEL_YEAR", "1980"))
-MAX_MILEAGE = float(os.getenv("MAX_MILEAGE", "999999"))
+MAX_MILEAGE = float(os.getenv("MAX_MILEAGE", "450000"))
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -145,7 +145,13 @@ def _bucket_rare_categories(df: pd.DataFrame, cols: list[str], min_count: int) -
 
 def _apply_training_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Conservative row filters; logs counts per rule in returned stats."""
-    stats: dict[str, Any] = {"input_rows": int(len(df))}
+    stats: dict[str, Any] = {
+        "input_rows": int(len(df)),
+        "min_price_usd": MIN_PRICE,
+        "max_price_usd": MAX_PRICE,
+        "min_model_year": MIN_MODEL_YEAR,
+        "max_mileage_cap": MAX_MILEAGE,
+    }
     d = df.copy()
     n0 = len(d)
 
@@ -251,14 +257,32 @@ PARAM_GRID_RF_ET: dict[str, list] = {
 }
 
 PARAM_GRID_HGB: dict[str, list] = {
-    "learning_rate": [0.03, 0.05, 0.1],
+    "learning_rate": [0.03, 0.05, 0.08],
     "max_depth": [6, 10, None],
     "max_leaf_nodes": [15, 31, 63],
-    "min_samples_leaf": [10, 20, 40],
-    "max_iter": [200],
+    "min_samples_leaf": [20, 28, 40],
+    "max_iter": [200, 250],
 }
 
-DEFAULT_RF = {"n_estimators": 200, "max_depth": 20, "min_samples_leaf": 4, "max_features": "sqrt"}
+DEFAULT_RF = {"n_estimators": 300, "max_depth": 20, "min_samples_leaf": 6, "max_features": "sqrt"}
+
+# Validation ranking: composite penalizes heavy tails (RMSE) and systematic shift (bias), not MAPE alone.
+VAL_COMPOSITE_RMSE_WEIGHT = float(os.getenv("VAL_COMPOSITE_RMSE_WEIGHT", "0.0025"))
+VAL_COMPOSITE_BIAS_WEIGHT = float(os.getenv("VAL_COMPOSITE_BIAS_WEIGHT", "0.12"))
+
+
+def _val_composite_score(
+    mae: float | None,
+    rmse: float | None,
+    bias: float | None,
+) -> float:
+    """Lower is better. Used to rank benchmark rows and tuned finalists on the calendar validation day."""
+    m = float(mae) if mae is not None and np.isfinite(float(mae)) else float("inf")
+    if not np.isfinite(m):
+        return float("inf")
+    r = float(rmse) if rmse is not None and np.isfinite(float(rmse)) else 0.0
+    b = float(bias) if bias is not None and np.isfinite(float(bias)) else 0.0
+    return float(m + VAL_COMPOSITE_RMSE_WEIGHT * r + VAL_COMPOSITE_BIAS_WEIGHT * abs(b))
 
 
 def _dollar_metrics_dict(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
@@ -284,14 +308,14 @@ def _y_for_target(df: pd.DataFrame, target_mode: TargetMode) -> pd.Series:
     return df[TARGET_LOG]
 
 
-def _num_cols_variant(df: pd.DataFrame, variant: Literal["A", "B"]) -> list[str]:
-    base = ["vehicle_age", "log_mileage", "cylinders"]
-    cols = [c for c in base if c in df.columns]
+def _num_cols_for_variant(df: pd.DataFrame, variant: Literal["A", "B", "C"]) -> list[str]:
+    """A: age + log mileage; B: year + raw mileage; C: full numeric set (may include redundant pairs for fair benchmark)."""
+    if variant == "A":
+        return [c for c in ("vehicle_age", "log_mileage", "cylinders") if c in df.columns]
     if variant == "B":
-        for extra in ("year_num", "mileage_num"):
-            if extra in df.columns and extra not in cols:
-                cols.append(extra)
-    return cols
+        return [c for c in ("year_num", "mileage_num", "cylinders") if c in df.columns]
+    order = ["vehicle_age", "log_mileage", "year_num", "mileage_num", "cylinders"]
+    return [c for c in order if c in df.columns]
 
 
 def _select_feature_variant(
@@ -299,25 +323,33 @@ def _select_feature_variant(
     tune_val: pd.DataFrame,
     cat_cols: list[str],
 ) -> tuple[list[str], str]:
-    """Variant A = age + log_mileage + cylinders; B adds year_num + mileage_num if >1% val MAE gain (RF+log)."""
-    num_a = _num_cols_variant(tune_train, "A")
-    num_b = _num_cols_variant(tune_train, "B")
-    if len(num_b) <= len(num_a):
-        return num_a, "A"
-    feats_a = cat_cols + num_a
-    feats_b = cat_cols + num_b
+    """Pick A, B, or C by lowest calendar-validation MAE (USD) with a fixed RF+log probe."""
+    candidates: list[tuple[str, list[str]]] = []
+    for label in ("A", "B", "C"):
+        cols = _num_cols_for_variant(tune_train, label)
+        if cols:
+            candidates.append((label, cols))
+    if not candidates:
+        return [], "A"
     reg = RandomForestRegressor(random_state=42, n_jobs=-1, **DEFAULT_RF)
-    mae_a = _quick_val_mae_dollars(
-        reg, feats_a, cat_cols, num_a, tune_train, tune_val, "log"
-    )
-    mae_b = _quick_val_mae_dollars(
-        reg, feats_b, cat_cols, num_b, tune_train, tune_val, "log"
-    )
-    if np.isfinite(mae_b) and mae_b < mae_a * 0.99:
-        logging.info("Feature variant B selected (val MAE %.2f vs A %.2f)", mae_b, mae_a)
-        return num_b, "B"
-    logging.info("Feature variant A selected (val MAE A=%.2f B=%.2f)", mae_a, mae_b)
-    return num_a, "A"
+    best_label, best_cols, best_mae = candidates[0][0], candidates[0][1], float("inf")
+    for label, num_cols in candidates:
+        feats = cat_cols + num_cols
+        mae = _quick_val_mae_dollars(
+            reg, feats, cat_cols, num_cols, tune_train, tune_val, "log"
+        )
+        logging.info(
+            "Feature variant %s: val MAE (RF+log, USD)=%.4f cols=%s",
+            label,
+            mae if np.isfinite(mae) else float("nan"),
+            num_cols,
+        )
+        if np.isfinite(mae) and mae < best_mae:
+            best_mae = mae
+            best_label = label
+            best_cols = list(num_cols)
+    logging.info("Selected feature variant %s (best probe val MAE %.4f)", best_label, best_mae)
+    return best_cols, best_label
 
 
 def _quick_val_mae_dollars(
@@ -405,21 +437,26 @@ def _default_regressor_builders() -> list[tuple[str, Callable[[], Any]]]:
             "HistGradientBoostingRegressor",
             lambda: HistGradientBoostingRegressor(
                 random_state=42,
-                max_iter=200,
-                learning_rate=0.08,
+                max_iter=250,
+                learning_rate=0.06,
                 max_depth=10,
                 max_leaf_nodes=31,
-                min_samples_leaf=20,
+                min_samples_leaf=28,
             ),
         ),
     ]
 
 
-def _benchmark_sort_key(row: dict[str, Any]) -> tuple[float, float, float]:
+def _benchmark_sort_key(row: dict[str, Any]) -> tuple[float, float, float, float]:
+    comp = _val_composite_score(row.get("val_mae"), row.get("val_rmse"), row.get("val_bias"))
+    mae = row.get("val_mae")
+    rmse = row.get("val_rmse")
+    bias = row.get("val_bias")
     return (
-        float(row["val_mae"]),
-        float(row["val_rmse"]),
-        abs(float(row["val_bias"])),
+        comp,
+        float(mae) if mae is not None and np.isfinite(float(mae)) else float("inf"),
+        float(rmse) if rmse is not None and np.isfinite(float(rmse)) else float("inf"),
+        abs(float(bias)) if bias is not None and np.isfinite(float(bias)) else 0.0,
     )
 
 
@@ -509,11 +546,11 @@ def _default_params_for_model(model_name: str) -> dict[str, Any]:
         return dict(DEFAULT_RF)
     if model_name == "HistGradientBoostingRegressor":
         return {
-            "max_iter": 200,
-            "learning_rate": 0.08,
+            "max_iter": 250,
+            "learning_rate": 0.06,
             "max_depth": 10,
             "max_leaf_nodes": 31,
-            "min_samples_leaf": 20,
+            "min_samples_leaf": 28,
         }
     return {}
 
@@ -588,6 +625,9 @@ def _build_model_benchmark_df(
                 "val_rmse": r.get("val_rmse"),
                 "val_mape": r.get("val_mape"),
                 "val_bias": r.get("val_bias"),
+                "val_composite": _val_composite_score(
+                    r.get("val_mae"), r.get("val_rmse"), r.get("val_bias")
+                ),
                 "selected": "no",
             }
         )
@@ -604,6 +644,9 @@ def _build_model_benchmark_df(
                 "val_rmse": m.get("val_rmse"),
                 "val_mape": m.get("val_mape"),
                 "val_bias": m.get("val_bias"),
+                "val_composite": _val_composite_score(
+                    m.get("val_mae"), m.get("val_rmse"), m.get("val_bias")
+                ),
                 "selected": "yes" if is_winner else "no",
             }
         )
@@ -618,6 +661,7 @@ def _build_model_benchmark_df(
                 "val_rmse": None,
                 "val_mape": None,
                 "val_bias": None,
+                "val_composite": None,
                 "selected": "yes",
             }
         )
@@ -773,7 +817,7 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
             chosen_name = "RandomForestRegressor"
             chosen_target_mode = "log"
             chosen_params = dict(DEFAULT_RF)
-            num_cols = _num_cols_variant(train_df, "A")
+            num_cols = _num_cols_for_variant(train_df, "A")
             feats = cat_cols + num_cols
         else:
             for fin in top_finalists:
@@ -804,12 +848,14 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
                     }
                 )
 
-            def _finalist_sort_key(f: dict[str, Any]) -> tuple[float, float, float]:
+            def _finalist_sort_key(f: dict[str, Any]) -> tuple[float, float, float, float]:
                 m = f.get("validation_after_tune") or {}
-                return (
-                    float(m.get("val_mae", float("inf"))),
-                    float(m.get("val_rmse", float("inf"))),
-                    abs(float(m.get("val_bias", 0.0))),
+                return _benchmark_sort_key(
+                    {
+                        "val_mae": m.get("val_mae"),
+                        "val_rmse": m.get("val_rmse"),
+                        "val_bias": m.get("val_bias"),
+                    }
                 )
 
             finalists_tuned.sort(key=_finalist_sort_key)
@@ -827,7 +873,7 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         chosen_name = "RandomForestRegressor"
         chosen_target_mode = "log"
         chosen_params = dict(DEFAULT_RF)
-        num_cols = _num_cols_variant(train_df, "A")
+        num_cols = _num_cols_for_variant(train_df, "A")
         feats = cat_cols + num_cols
 
     reg_final = _build_reg_for_model(chosen_name, chosen_params)
@@ -940,9 +986,12 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         "selected": chosen_name,
         "selected_target_strategy": chosen_target_mode,
         "selection_rule": (
-            "time-aware validation on second-latest local date (dollar MAE/RMSE/bias); "
-            "benchmark 4 models x (raw|log) targets; tune top 2 (model,target) pairs; "
-            "winner = lowest post-tune val MAE then RMSE then |bias|; final holdout = latest local date"
+            "time-aware validation on second-latest local date; metrics in USD (log models via expm1); "
+            "benchmark 4 models x (raw|log); tune top 2 (model,target) pairs; "
+            "winner = lowest val_composite = MAE + "
+            f"{VAL_COMPOSITE_RMSE_WEIGHT}*RMSE + {VAL_COMPOSITE_BIAS_WEIGHT}*|bias| "
+            "then MAE, RMSE, |bias|; MAPE shown but not used for ranking; "
+            "final holdout = latest local date"
         ),
     }
 
@@ -955,13 +1004,17 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         else "original_usd (direct predictions vs actual price_num)"
     )
     target_training_col = TARGET_LOG if chosen_target_mode == "log" else TARGET_ORIGINAL
-    feature_notes_txt = (
-        "variant B: vehicle_age, log_mileage, cylinders, year_num, mileage_num (+ categoricals)"
-        if feature_variant_label == "B"
-        else (
-            "variant A: vehicle_age, log_mileage, cylinders (+ categoricals); "
-            "year_num/mileage_num omitted as redundant with age/log mileage"
-        )
+    _VARIANT_NOTES = {
+        "A": "variant A: vehicle_age, log_mileage, cylinders (+ categoricals)",
+        "B": "variant B: year_num, mileage_num, cylinders (+ categoricals)",
+        "C": (
+            "variant C: vehicle_age, log_mileage, year_num, mileage_num, cylinders (+ categoricals); "
+            "redundant pairs allowed if validation probe (RF+log) favors them"
+        ),
+    }
+    feature_notes_txt = _VARIANT_NOTES.get(
+        feature_variant_label,
+        f"numeric features {num_cols} (+ categoricals)",
     )
 
     benchmark_block = {
@@ -975,6 +1028,12 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         "validation_date_local": str(val_local) if val_local is not None else None,
         "holdout_date_local": str(today_local),
         "feature_variant": feature_variant_label,
+        "validation_ranking": {
+            "val_composite_formula": (
+                f"MAE + {VAL_COMPOSITE_RMSE_WEIGHT}*RMSE + {VAL_COMPOSITE_BIAS_WEIGHT}*abs(bias)"
+            ),
+            "note": "Lower val_composite is better for ranking benchmark rows and tuned finalists.",
+        },
         "skip_reason": benchmark_skip_reason,
         "candidate_results": candidate_results,
         "tuned_finalists": finalists_tuned,
