@@ -1,4 +1,4 @@
-# Craigslist car listings — ETL, LLM enrichment, and price model (Mid Term Project)
+# Craigslist car listings - ETL, LLM enrichment, and price model (Mid Term Project)
 
 Mid term project pipeline that scrapes Craigslist car listings (scraper **unchanged** in this repo), extracts structured fields with **regex + Vertex Gemini**, materializes a master CSV, trains a **time-aware** price model in GCP (**sklearn benchmark**: DecisionTree, RandomForest, ExtraTrees, HistGradientBoosting; **raw vs log** target; winner tuned on a calendar validation day), and syncs **metrics, predictions, and interpretability artifacts** back to GitHub for analysis in a notebook.
 
