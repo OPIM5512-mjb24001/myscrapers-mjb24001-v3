@@ -5,7 +5,7 @@ Populated by **GitHub Actions → Sync model artifacts to repo** from GCS `struc
 | Subfolder | Contents |
 |-----------|----------|
 | `predictions/` | `<run_id>-predictions.csv` |
-| `metrics/` | `<run_id>-metrics.json`, `-metrics.csv`, `-model_info.json` |
+| `metrics/` | `<run_id>-metrics.json`, `-metrics.csv`, `-model_info.json`, `-model_benchmark.csv` |
 | `permutation_importance/` | `<run_id>-permutation_importance.csv` |
 | `pdp/` | `<run_id>_pdp_top*.png` |
 | `history/` | `metrics_history.csv` (cumulative) |

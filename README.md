@@ -9,7 +9,7 @@ Mid term project pipeline that scrapes Craigslist car listings (scraper **unchan
 3. **LLM ETL**: `extractor-llm-poc` reads each JSONL, downloads `source_txt`, merges regex hints with Gemini JSON → `jsonl_llm/<post_id>_llm.jsonl`.
 4. **Materialize**: `materialize-master-llm` dedupes by `post_id` (newest run wins) → **`structured/datasets/listings_master_llm.csv`** (canonical training table).
 5. **Train**: `train-dt` reads the LLM master CSV, uses **America/New_York** local dates, **holds out the latest day**, and when ≥3 days exist benchmarks **DecisionTree / RandomForest / ExtraTrees / HistGradientBoosting** on **raw `price_num` vs `log1p(price_num)`** using the **second-latest day** as validation (no random split). The **top two (model, target)** pairs are **ParameterSampler-tuned** on that same validation day; the winner is refit on all pre-holdout rows. **`predictions.csv` and reported MAE/MAPE/RMSE/bias stay on original USD** (log models use `expm1` on the holdout). Evidence lives in **`metrics.json` / `model_info.json`** under **`benchmark`**. Artifacts: **`structured/model_runs/<YYYYMMDDHH>/`**.
-6. **Sync**: GitHub Actions copies the latest run’s files into **`results/`** subfolders for grading and notebooks.
+6. **Sync**: GitHub Actions copies the latest run’s files into **`results/`** subfolders (including **`model_benchmark.csv`** next to metrics JSON) for grading and [`model_trending.ipynb`](notebooks/model_trending.ipynb).
 
 ## What changed from the baseline
 
@@ -51,6 +51,7 @@ Each training run (not dry run) writes to `gs://<bucket>/structured/model_runs/<
 | `permutation_importance.csv` | All input features, mean/std importance on holdout |
 | `pdp/pdp_top*.png` | Partial dependence plots for top 3 features by importance |
 | `model_info.json` | Feature lists, `target_strategy`, `benchmark` block, chosen params, filtering summary |
+| `model_benchmark.csv` | Flat benchmark + tuned-finalist rows (`selected` marks the winner) for notebooks |
 | `metrics_history.csv` | Snapshot of cumulative history (also appended to `structured/model_runs/metrics_history.csv`) |
 
 ## Repo `results/` layout 
@@ -60,7 +61,7 @@ Synced artifacts land **only** in these subfolders (no new files committed to `r
 ```
 results/
   predictions/              <run_id>-predictions.csv
-  metrics/                    <run_id>-metrics.json, <run_id>-metrics.csv, <run_id>-model_info.json
+  metrics/                    <run_id>-metrics.json, <run_id>-metrics.csv, <run_id>-model_info.json, <run_id>-model_benchmark.csv
   permutation_importance/     <run_id>-permutation_importance.csv
   pdp/                        <run_id>_pdp_top*.png  (may be empty until a run produces PDPs)
   history/                    metrics_history.csv    (cumulative, overwritten each sync)
@@ -70,8 +71,8 @@ results/
 
 ## Notebook (Colab / local)
 
-- Path: [`notebooks/model_trending.ipynb`](notebooks/model_trending.ipynb)
-- **No GCP credentials** and **no retraining** — only reads synced files under `results/{history,permutation_importance,pdp}/` and related paths.
+- Path: [`notebooks/model_trending.ipynb`](notebooks/model_trending.ipynb) — **primary grader-facing summary**: time-aware design, benchmark table (`model_benchmark.csv` or `metrics.json`), holdout metrics, trends, permutation importance, PDPs, and short written interpretation (**no retraining**, no GCP).
+- Reads synced artifacts under `results/metrics/`, `results/history/`, `results/permutation_importance/`, `results/pdp/`.
 - **Colab**: defaults clone **`https://github.com/OPIM5512-mjb24001/myscrapers-mjb24001-v3.git`**. For a fork, set `NOTEBOOK_REPO_URL` (optional: `NOTEBOOK_REPO_BRANCH`, default `main`).
 
 ## How to run / validate

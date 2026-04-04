@@ -564,6 +564,66 @@ def _pick_top_two_finalists(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _build_model_benchmark_df(
+    run_id: str,
+    chosen_name: str,
+    chosen_target_mode: TargetMode,
+    candidate_results: list[dict[str, Any]],
+    finalists_tuned: list[dict[str, Any]],
+) -> pd.DataFrame:
+    """
+    Flat table for notebooks / graders: default-param benchmark rows + tuned finalist rows.
+    `selected` = yes only for the tuned finalist row that matches the final refit model.
+    If no benchmark rows exist (e.g. insufficient dates), emit a single fallback row.
+    """
+    rows: list[dict[str, Any]] = []
+    for r in candidate_results:
+        rows.append(
+            {
+                "run_id": run_id,
+                "stage": "benchmark_default_params",
+                "model": r["model"],
+                "target_strategy": r["target_strategy"],
+                "val_mae": r.get("val_mae"),
+                "val_rmse": r.get("val_rmse"),
+                "val_mape": r.get("val_mape"),
+                "val_bias": r.get("val_bias"),
+                "selected": "no",
+            }
+        )
+    for f in finalists_tuned:
+        is_winner = f["model"] == chosen_name and f["target_strategy"] == chosen_target_mode
+        m = f.get("validation_after_tune") or {}
+        rows.append(
+            {
+                "run_id": run_id,
+                "stage": "tuned_finalist",
+                "model": f["model"],
+                "target_strategy": f["target_strategy"],
+                "val_mae": m.get("val_mae"),
+                "val_rmse": m.get("val_rmse"),
+                "val_mape": m.get("val_mape"),
+                "val_bias": m.get("val_bias"),
+                "selected": "yes" if is_winner else "no",
+            }
+        )
+    if not rows:
+        rows.append(
+            {
+                "run_id": run_id,
+                "stage": "fallback_no_time_aware_benchmark",
+                "model": chosen_name,
+                "target_strategy": chosen_target_mode,
+                "val_mae": None,
+                "val_rmse": None,
+                "val_mape": None,
+                "val_bias": None,
+                "selected": "yes",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def run_once(dry_run: bool = False) -> dict[str, Any]:
     client = storage.Client(project=PROJECT_ID or None)
     df = _read_csv_from_gcs(client, GCS_BUCKET, DATA_KEY)
@@ -1054,6 +1114,21 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
             GCS_BUCKET,
             f"{run_prefix}/model_info.json",
             json.dumps(model_info, indent=2, default=str),
+        )
+
+        bench_df = _build_model_benchmark_df(
+            run_id,
+            chosen_name,
+            chosen_target_mode,
+            candidate_results,
+            finalists_tuned,
+        )
+        _write_text_to_gcs(
+            client,
+            GCS_BUCKET,
+            f"{run_prefix}/model_benchmark.csv",
+            bench_df.to_csv(index=False),
+            "text/csv",
         )
 
         tune_val_mae_hist = None
