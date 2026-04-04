@@ -1,6 +1,6 @@
 # Time-aware training: train on all local dates before latest; hold out latest day.
-# Tuned tree ensemble (RandomForest vs ExtraTrees) + artifacts under structured/model_runs/<run_id>/
-# Target: log1p(price); metrics and predictions on original dollar scale.
+# Benchmarks multiple sklearn regressors on raw vs log1p(price); tunes top-2 on time-aware val day.
+# Artifacts under structured/model_runs/<run_id>/; metrics on original USD.
 # HTTP entrypoint: train_dt_http
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import os
 import re
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import matplotlib
 
@@ -22,7 +22,11 @@ import numpy as np
 import pandas as pd
 from google.cloud import storage
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
+from sklearn.ensemble import (
+    ExtraTreesRegressor,
+    HistGradientBoostingRegressor,
+    RandomForestRegressor,
+)
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import PartialDependenceDisplay, permutation_importance
 from sklearn.metrics import make_scorer, mean_absolute_error, mean_squared_error
@@ -223,14 +227,295 @@ def _bias(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.mean(y_pred - y_true))
 
 
-def _dollar_mae_from_log(y_log_true: np.ndarray, y_log_pred: np.ndarray) -> float:
-    return float(mean_absolute_error(np.expm1(y_log_true), np.expm1(y_log_pred)))
-
-
 dollar_mae_scorer = make_scorer(
     lambda y_true_log, y_pred_log: -mean_absolute_error(np.expm1(y_true_log), np.expm1(y_pred_log)),
     greater_is_better=True,
 )
+
+raw_dollar_mae_scorer = make_scorer(
+    lambda y_true, y_pred: -mean_absolute_error(y_true, y_pred),
+    greater_is_better=True,
+)
+
+TargetMode = Literal["raw", "log"]
+
+# Tuning search sizes (time-aware validation only; no K-fold)
+TUNE_N_ITER_RF_ET = 16
+TUNE_N_ITER_HGB = 16
+
+PARAM_GRID_RF_ET: dict[str, list] = {
+    "n_estimators": [100, 200, 400],
+    "max_depth": [10, 20, 30, None],
+    "min_samples_leaf": [1, 2, 4, 8],
+    "max_features": ["sqrt", 0.3, 0.5, 0.7],
+}
+
+PARAM_GRID_HGB: dict[str, list] = {
+    "learning_rate": [0.03, 0.05, 0.1],
+    "max_depth": [6, 10, None],
+    "max_leaf_nodes": [15, 31, 63],
+    "min_samples_leaf": [10, 20, 40],
+    "max_iter": [200],
+}
+
+DEFAULT_RF = {"n_estimators": 200, "max_depth": 20, "min_samples_leaf": 4, "max_features": "sqrt"}
+
+
+def _dollar_metrics_dict(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return {
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "mape": _mape(y_true, y_pred),
+        "rmse": _rmse(y_true, y_pred),
+        "bias": _bias(y_true, y_pred),
+    }
+
+
+def _preds_to_dollars(y_pred: np.ndarray, target_mode: TargetMode) -> np.ndarray:
+    if target_mode == "log":
+        return np.expm1(y_pred)
+    return y_pred
+
+
+def _y_for_target(df: pd.DataFrame, target_mode: TargetMode) -> pd.Series:
+    if target_mode == "raw":
+        return df[TARGET_ORIGINAL]
+    return df[TARGET_LOG]
+
+
+def _num_cols_variant(df: pd.DataFrame, variant: Literal["A", "B"]) -> list[str]:
+    base = ["vehicle_age", "log_mileage", "cylinders"]
+    cols = [c for c in base if c in df.columns]
+    if variant == "B":
+        for extra in ("year_num", "mileage_num"):
+            if extra in df.columns and extra not in cols:
+                cols.append(extra)
+    return cols
+
+
+def _select_feature_variant(
+    tune_train: pd.DataFrame,
+    tune_val: pd.DataFrame,
+    cat_cols: list[str],
+) -> tuple[list[str], str]:
+    """Variant A = age + log_mileage + cylinders; B adds year_num + mileage_num if >1% val MAE gain (RF+log)."""
+    num_a = _num_cols_variant(tune_train, "A")
+    num_b = _num_cols_variant(tune_train, "B")
+    if len(num_b) <= len(num_a):
+        return num_a, "A"
+    feats_a = cat_cols + num_a
+    feats_b = cat_cols + num_b
+    reg = RandomForestRegressor(random_state=42, n_jobs=-1, **DEFAULT_RF)
+    mae_a = _quick_val_mae_dollars(
+        reg, feats_a, cat_cols, num_a, tune_train, tune_val, "log"
+    )
+    mae_b = _quick_val_mae_dollars(
+        reg, feats_b, cat_cols, num_b, tune_train, tune_val, "log"
+    )
+    if np.isfinite(mae_b) and mae_b < mae_a * 0.99:
+        logging.info("Feature variant B selected (val MAE %.2f vs A %.2f)", mae_b, mae_a)
+        return num_b, "B"
+    logging.info("Feature variant A selected (val MAE A=%.2f B=%.2f)", mae_a, mae_b)
+    return num_a, "A"
+
+
+def _quick_val_mae_dollars(
+    regressor,
+    feats: list[str],
+    cat_cols: list[str],
+    num_cols: list[str],
+    tune_train: pd.DataFrame,
+    tune_val: pd.DataFrame,
+    target_mode: TargetMode,
+) -> float:
+    y_tr = _y_for_target(tune_train, target_mode)
+    y_va = _y_for_target(tune_val, target_mode)
+    y_dollar_va = tune_val[TARGET_ORIGINAL]
+    m_tr = y_tr.notna()
+    m_va = y_dollar_va.notna() & y_va.notna()
+    if not m_tr.any() or not m_va.any():
+        return float("nan")
+    pipe = _build_preprocess_and_model(cat_cols, num_cols, regressor)
+    try:
+        pipe.fit(tune_train.loc[m_tr, feats], y_tr.loc[m_tr])
+        raw_p = pipe.predict(tune_val.loc[m_va, feats])
+        pred_d = _preds_to_dollars(raw_p, target_mode)
+        return float(mean_absolute_error(y_dollar_va.loc[m_va].values.astype(float), pred_d))
+    except Exception:
+        return float("nan")
+
+
+def _benchmark_one(
+    name: str,
+    regressor,
+    target_mode: TargetMode,
+    cat_cols: list[str],
+    num_cols: list[str],
+    feats: list[str],
+    tune_train: pd.DataFrame,
+    tune_val: pd.DataFrame,
+) -> dict[str, Any] | None:
+    y_tr = _y_for_target(tune_train, target_mode)
+    y_va_space = _y_for_target(tune_val, target_mode)
+    y_dollar_va = tune_val[TARGET_ORIGINAL]
+    m_tr = y_tr.notna()
+    m_va = y_dollar_va.notna() & y_va_space.notna()
+    if not m_tr.any() or not m_va.any():
+        return None
+    pipe = _build_preprocess_and_model(cat_cols, num_cols, regressor)
+    try:
+        pipe.fit(tune_train.loc[m_tr, feats], y_tr.loc[m_tr])
+        raw_p = pipe.predict(tune_val.loc[m_va, feats])
+        pred_d = _preds_to_dollars(raw_p, target_mode)
+        yt = y_dollar_va.loc[m_va].values.astype(float)
+        m = _dollar_metrics_dict(yt, pred_d)
+        return {
+            "model": name,
+            "target_strategy": target_mode,
+            "val_mae": m["mae"],
+            "val_rmse": m["rmse"],
+            "val_mape": m["mape"],
+            "val_bias": m["bias"],
+        }
+    except Exception as ex:
+        logging.warning("Benchmark failed %s %s: %s", name, target_mode, ex)
+        return None
+
+
+def _default_regressor_builders() -> list[tuple[str, Callable[[], Any]]]:
+    return [
+        (
+            "DecisionTreeRegressor",
+            lambda: DecisionTreeRegressor(
+                max_depth=12, min_samples_leaf=15, random_state=42
+            ),
+        ),
+        (
+            "RandomForestRegressor",
+            lambda: RandomForestRegressor(random_state=42, n_jobs=-1, **DEFAULT_RF),
+        ),
+        (
+            "ExtraTreesRegressor",
+            lambda: ExtraTreesRegressor(
+                random_state=42, n_jobs=-1, bootstrap=False, **DEFAULT_RF
+            ),
+        ),
+        (
+            "HistGradientBoostingRegressor",
+            lambda: HistGradientBoostingRegressor(
+                random_state=42,
+                max_iter=200,
+                learning_rate=0.08,
+                max_depth=10,
+                max_leaf_nodes=31,
+                min_samples_leaf=20,
+            ),
+        ),
+    ]
+
+
+def _benchmark_sort_key(row: dict[str, Any]) -> tuple[float, float, float]:
+    return (
+        float(row["val_mae"]),
+        float(row["val_rmse"]),
+        abs(float(row["val_bias"])),
+    )
+
+
+def _tune_on_val(
+    model_name: str,
+    build_reg: Callable[[dict[str, Any]], Any],
+    param_grid: dict[str, list],
+    target_mode: TargetMode,
+    cat_cols: list[str],
+    num_cols: list[str],
+    feats: list[str],
+    tune_train: pd.DataFrame,
+    tune_val: pd.DataFrame,
+    n_iter: int,
+    default_params: dict[str, Any],
+) -> tuple[dict[str, Any], float, dict[str, float]]:
+    y_tr = _y_for_target(tune_train, target_mode)
+    y_va_space = _y_for_target(tune_val, target_mode)
+    y_dollar_va = tune_val[TARGET_ORIGINAL]
+    best_params: dict[str, Any] = {}
+    best_mae = float("inf")
+    best_metrics: dict[str, float] = {}
+    for params in ParameterSampler(param_grid, n_iter=n_iter, random_state=42):
+        p = dict(params)
+        try:
+            reg = build_reg(p)
+            row = _benchmark_one(
+                model_name, reg, target_mode, cat_cols, num_cols, feats, tune_train, tune_val
+            )
+            if row is None:
+                continue
+            mae = row["val_mae"]
+            if mae < best_mae:
+                best_mae = mae
+                best_params = p
+                best_metrics = {
+                    "val_mae": row["val_mae"],
+                    "val_rmse": row["val_rmse"],
+                    "val_mape": row["val_mape"],
+                    "val_bias": row["val_bias"],
+                }
+        except Exception as ex:
+            logging.warning("Tune iteration failed (%s): %s", model_name, ex)
+    if not best_params or not np.isfinite(best_mae):
+        reg0 = build_reg(default_params)
+        row = _benchmark_one(
+            model_name, reg0, target_mode, cat_cols, num_cols, feats, tune_train, tune_val
+        )
+        return dict(default_params), float(row["val_mae"]) if row else float("nan"), (
+            {k: float(row[k]) for k in ("val_mae", "val_rmse", "val_mape", "val_bias")} if row else {}
+        )
+    return best_params, best_mae, best_metrics
+
+
+def _build_reg_for_model(model_name: str, params: dict[str, Any]) -> Any:
+    if model_name == "DecisionTreeRegressor":
+        return DecisionTreeRegressor(random_state=42, **params)
+    if model_name == "RandomForestRegressor":
+        return RandomForestRegressor(random_state=42, n_jobs=-1, **params)
+    if model_name == "ExtraTreesRegressor":
+        return ExtraTreesRegressor(
+            random_state=42, n_jobs=-1, bootstrap=False, **params
+        )
+    if model_name == "HistGradientBoostingRegressor":
+        return HistGradientBoostingRegressor(random_state=42, **params)
+    raise ValueError(f"unknown model {model_name}")
+
+
+def _param_grid_for_model(model_name: str) -> dict[str, list]:
+    if model_name in ("RandomForestRegressor", "ExtraTreesRegressor"):
+        return PARAM_GRID_RF_ET
+    if model_name == "HistGradientBoostingRegressor":
+        return PARAM_GRID_HGB
+    if model_name == "DecisionTreeRegressor":
+        return {
+            "max_depth": [8, 12, 16, 24, None],
+            "min_samples_leaf": [5, 10, 20, 40],
+            "min_samples_split": [2, 10, 20],
+        }
+    return {}
+
+
+def _default_params_for_model(model_name: str) -> dict[str, Any]:
+    if model_name == "DecisionTreeRegressor":
+        return {"max_depth": 12, "min_samples_leaf": 15, "min_samples_split": 2}
+    if model_name in ("RandomForestRegressor", "ExtraTreesRegressor"):
+        return dict(DEFAULT_RF)
+    if model_name == "HistGradientBoostingRegressor":
+        return {
+            "max_iter": 200,
+            "learning_rate": 0.08,
+            "max_depth": 10,
+            "max_leaf_nodes": 31,
+            "min_samples_leaf": 20,
+        }
+    return {}
 
 
 def _build_preprocess_and_model(
@@ -256,78 +541,27 @@ def _build_preprocess_and_model(
     return Pipeline([("pre", pre), ("model", regressor)])
 
 
-def _dt_baseline_mae_dollars(
-    X_train: pd.DataFrame,
-    y_log_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_log_val: pd.Series,
-    cat_cols: list[str],
-    num_cols: list[str],
-) -> float | None:
-    if X_val.empty or not y_log_val.notna().any():
-        return None
-    pre = ColumnTransformer(
-        transformers=[
-            ("num", SimpleImputer(strategy="median"), num_cols),
-            (
-                "cat",
-                Pipeline(
-                    [
-                        ("imp", SimpleImputer(strategy="most_frequent")),
-                        ("oh", OneHotEncoder(handle_unknown="ignore", max_categories=50, sparse_output=False)),
-                    ]
-                ),
-                cat_cols,
-            ),
-        ],
-    )
-    pipe = Pipeline(
-        [("pre", pre), ("model", DecisionTreeRegressor(max_depth=8, min_samples_leaf=10, random_state=42))]
-    )
-    try:
-        m_tr = y_log_train.notna()
-        m_va = y_log_val.notna()
-        pipe.fit(X_train.loc[m_tr], y_log_train.loc[m_tr])
-        pred_log = pipe.predict(X_val.loc[m_va])
-        return _dollar_mae_from_log(y_log_val.loc[m_va].values.astype(float), pred_log)
-    except Exception:
-        return None
+def _tune_n_iter_for_model(model_name: str) -> int:
+    if model_name == "HistGradientBoostingRegressor":
+        return TUNE_N_ITER_HGB
+    if model_name == "DecisionTreeRegressor":
+        return 18
+    return TUNE_N_ITER_RF_ET
 
 
-def _tune_ensemble(
-    name: str,
-    build_reg: Callable[[dict[str, Any]], Any],
-    param_grid: dict[str, list],
-    X_tr: pd.DataFrame,
-    y_log_tr: pd.Series,
-    X_va: pd.DataFrame,
-    y_log_va: pd.Series,
-    cat_cols: list[str],
-    num_cols: list[str],
-    default_params: dict[str, Any],
-    n_iter: int = 12,
-) -> tuple[dict[str, Any], float]:
-    best_mae = float("inf")
-    best_params: dict[str, Any] = {}
-    for params in ParameterSampler(param_grid, n_iter=n_iter, random_state=42):
-        p = dict(params)
-        try:
-            reg = build_reg(p)
-            pipe = _build_preprocess_and_model(cat_cols, num_cols, reg)
-            pipe.fit(X_tr, y_log_tr)
-            pred_log = pipe.predict(X_va)
-            m_va = y_log_va.notna()
-            if not m_va.any():
-                continue
-            mae = _dollar_mae_from_log(y_log_va.loc[m_va].values.astype(float), pred_log[m_va.to_numpy()])
-            if mae < best_mae:
-                best_mae = mae
-                best_params = {k: v for k, v in p.items()}
-        except Exception as ex:
-            logging.warning("Tune iteration failed (%s): %s", name, ex)
-    if not best_params or not np.isfinite(best_mae):
-        return dict(default_params), float("nan")
-    return best_params, best_mae
+def _pick_top_two_finalists(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Distinct (model, target_strategy) pairs in benchmark order."""
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for r in sorted(rows, key=_benchmark_sort_key):
+        key = (r["model"], r["target_strategy"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+        if len(out) >= 2:
+            break
+    return out
 
 
 def run_once(dry_run: bool = False) -> dict[str, Any]:
@@ -410,9 +644,6 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
     if len(train_df) < 40:
         return {"status": "noop", "reason": "too few training rows", "train_rows": int(len(train_df))}
 
-    # Simplified numerics: vehicle_age + log_mileage (+ cylinders); drop redundant year_num / mileage_num
-    num_cols = ["vehicle_age", "log_mileage", "cylinders"]
-    num_cols = [c for c in num_cols if c in train_df.columns]
     cat_cols = [
         "make",
         "model",
@@ -428,111 +659,151 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         "zip_prefix",
     ]
     cat_cols = [c for c in cat_cols if c in train_df.columns]
-    feats = cat_cols + num_cols
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d%H")
     run_prefix = f"{MODEL_RUN_PREFIX}/{run_id}"
 
-    param_grid_shared: dict[str, list] = {
-        "n_estimators": [100, 200, 300],
-        "max_depth": [12, 20, 28, None],
-        "min_samples_leaf": [1, 2, 4, 8],
-        "max_features": ["sqrt", 0.3, 0.5],
-    }
+    benchmark_skip_reason: str | None = None
+    val_local: Any = None
+    tune_train = pd.DataFrame()
+    tune_val = pd.DataFrame()
+    candidate_results: list[dict[str, Any]] = []
+    finalists_tuned: list[dict[str, Any]] = []
+    feature_variant_label = "A"
+    num_cols: list[str] = []
+    feats: list[str] = []
 
-    default_rf = {"n_estimators": 200, "max_depth": 20, "min_samples_leaf": 4, "max_features": "sqrt"}
-    best_rf_params = dict(default_rf)
-    best_et_params = dict(default_rf)
-    tune_note = "defaults"
-    rf_tune_val_mae = float("nan")
-    et_tune_val_mae = float("nan")
-
-    if len(unique_dates) >= 3:
+    can_benchmark = len(unique_dates) >= 3
+    if can_benchmark:
         val_local = unique_dates[-2]
-        tune_train = train_df[train_df["date_local"] < val_local]
-        tune_val = train_df[train_df["date_local"] == val_local]
-        if len(tune_train) >= 40 and len(tune_val) >= 5:
-            X_tr, y_tr = tune_train[feats], tune_train[TARGET_LOG]
-            X_va, y_va = tune_val[feats], tune_val[TARGET_LOG]
+        tune_train = train_df[train_df["date_local"] < val_local].copy()
+        tune_val = train_df[train_df["date_local"] == val_local].copy()
+        if len(tune_train) < 40 or len(tune_val) < 5:
+            can_benchmark = False
+            benchmark_skip_reason = "insufficient rows on tune_train or tune_val for time-aware benchmark"
 
-            def build_rf(p: dict) -> RandomForestRegressor:
-                return RandomForestRegressor(random_state=42, n_jobs=-1, **p)
+    chosen_name: str
+    chosen_target_mode: TargetMode
+    chosen_params: dict[str, Any]
 
-            def build_et(p: dict) -> ExtraTreesRegressor:
-                return ExtraTreesRegressor(random_state=42, n_jobs=-1, bootstrap=False, **p)
-
-            best_rf_params, rf_tune_val_mae = _tune_ensemble(
-                "RandomForest",
-                build_rf,
-                param_grid_shared,
-                X_tr,
-                y_tr,
-                X_va,
-                y_va,
-                cat_cols,
-                num_cols,
-                default_rf,
-            )
-            best_et_params, et_tune_val_mae = _tune_ensemble(
-                "ExtraTrees",
-                build_et,
-                param_grid_shared,
-                X_tr,
-                y_tr,
-                X_va,
-                y_va,
-                cat_cols,
-                num_cols,
-                default_rf,
-            )
-            tune_note = (
-                f"val_date={val_local} rf_tune_mae_dollars={rf_tune_val_mae:.2f} "
-                f"et_tune_mae_dollars={et_tune_val_mae:.2f}"
-            )
-            logging.info("Tuning done: %s rf_params=%s et_params=%s", tune_note, best_rf_params, best_et_params)
-
-    # Select model by tune validation dollar MAE (lower wins); tie-break RF
-    if np.isfinite(rf_tune_val_mae) and np.isfinite(et_tune_val_mae):
-        if et_tune_val_mae < rf_tune_val_mae - 1e-9:
-            chosen_name = "ExtraTreesRegressor"
-            chosen_params = best_et_params
-            chosen_build = lambda p: ExtraTreesRegressor(random_state=42, n_jobs=-1, bootstrap=False, **p)
-        else:
+    if can_benchmark:
+        num_cols, feature_variant_label = _select_feature_variant(tune_train, tune_val, cat_cols)
+        feats = cat_cols + num_cols
+        for model_name, builder in _default_regressor_builders():
+            for tm in ("raw", "log"):
+                reg_inst = builder()
+                row = _benchmark_one(
+                    model_name,
+                    reg_inst,
+                    tm,
+                    cat_cols,
+                    num_cols,
+                    feats,
+                    tune_train,
+                    tune_val,
+                )
+                if row:
+                    row["validation_date_local"] = str(val_local)
+                    row["feature_variant"] = feature_variant_label
+                    candidate_results.append(row)
+        candidate_results.sort(key=_benchmark_sort_key)
+        top_finalists = _pick_top_two_finalists(candidate_results)
+        if not top_finalists:
+            benchmark_skip_reason = "all benchmark fits failed; fallback to RandomForest+log defaults"
             chosen_name = "RandomForestRegressor"
-            chosen_params = best_rf_params
-            chosen_build = lambda p: RandomForestRegressor(random_state=42, n_jobs=-1, **p)
-    elif np.isfinite(et_tune_val_mae):
-        chosen_name = "ExtraTreesRegressor"
-        chosen_params = best_et_params
-        chosen_build = lambda p: ExtraTreesRegressor(random_state=42, n_jobs=-1, bootstrap=False, **p)
-    elif np.isfinite(rf_tune_val_mae):
-        chosen_name = "RandomForestRegressor"
-        chosen_params = best_rf_params
-        chosen_build = lambda p: RandomForestRegressor(random_state=42, n_jobs=-1, **p)
-    else:
-        chosen_name = "RandomForestRegressor"
-        chosen_params = best_rf_params
-        chosen_build = lambda p: RandomForestRegressor(random_state=42, n_jobs=-1, **p)
+            chosen_target_mode = "log"
+            chosen_params = dict(DEFAULT_RF)
+            num_cols = _num_cols_variant(train_df, "A")
+            feats = cat_cols + num_cols
+        else:
+            for fin in top_finalists:
+                mn = fin["model"]
+                tm: TargetMode = fin["target_strategy"]
+                grid = _param_grid_for_model(mn)
+                defs = _default_params_for_model(mn)
+                n_it = _tune_n_iter_for_model(mn)
+                bp, _bmae, bmet = _tune_on_val(
+                    mn,
+                    lambda p, model_name=mn: _build_reg_for_model(model_name, p),
+                    grid,
+                    tm,
+                    cat_cols,
+                    num_cols,
+                    feats,
+                    tune_train,
+                    tune_val,
+                    n_it,
+                    defs,
+                )
+                finalists_tuned.append(
+                    {
+                        "model": mn,
+                        "target_strategy": tm,
+                        "tuned_params": bp,
+                        "validation_after_tune": bmet,
+                    }
+                )
 
-    reg_final = chosen_build(chosen_params)
+            def _finalist_sort_key(f: dict[str, Any]) -> tuple[float, float, float]:
+                m = f.get("validation_after_tune") or {}
+                return (
+                    float(m.get("val_mae", float("inf"))),
+                    float(m.get("val_rmse", float("inf"))),
+                    abs(float(m.get("val_bias", 0.0))),
+                )
+
+            finalists_tuned.sort(key=_finalist_sort_key)
+            winner = finalists_tuned[0]
+            chosen_name = winner["model"]
+            chosen_target_mode = winner["target_strategy"]
+            chosen_params = winner["tuned_params"]
+    else:
+        if benchmark_skip_reason is None:
+            benchmark_skip_reason = (
+                "fewer_than_3_distinct_local_dates"
+                if len(unique_dates) < 3
+                else "benchmark_disabled"
+            )
+        chosen_name = "RandomForestRegressor"
+        chosen_target_mode = "log"
+        chosen_params = dict(DEFAULT_RF)
+        num_cols = _num_cols_variant(train_df, "A")
+        feats = cat_cols + num_cols
+
+    reg_final = _build_reg_for_model(chosen_name, chosen_params)
     pipe = _build_preprocess_and_model(cat_cols, num_cols, reg_final)
-    X_train = train_df[feats]
-    y_train_log = train_df[TARGET_LOG]
-    pipe.fit(X_train, y_train_log)
+    y_train_fit = _y_for_target(train_df, chosen_target_mode)
+    m_fit = y_train_fit.notna()
+    pipe.fit(train_df.loc[m_fit, feats], y_train_fit.loc[m_fit])
 
     baseline_mae = None
-    if len(unique_dates) >= 3:
-        val_local = unique_dates[-2]
-        tune_train = train_df[train_df["date_local"] < val_local]
-        tune_val = train_df[train_df["date_local"] == val_local]
-        baseline_mae = _dt_baseline_mae_dollars(
-            tune_train[feats],
-            tune_train[TARGET_LOG],
-            tune_val[feats],
-            tune_val[TARGET_LOG],
-            cat_cols,
-            num_cols,
-        )
+    for row in candidate_results:
+        if row.get("model") == "DecisionTreeRegressor" and row.get("target_strategy") == "log":
+            baseline_mae = row.get("val_mae")
+            break
+
+    rf_tune_val_mae = next(
+        (f["validation_after_tune"]["val_mae"] for f in finalists_tuned if f["model"] == "RandomForestRegressor"),
+        float("nan"),
+    )
+    et_tune_val_mae = next(
+        (f["validation_after_tune"]["val_mae"] for f in finalists_tuned if f["model"] == "ExtraTreesRegressor"),
+        float("nan"),
+    )
+    best_rf_params = next(
+        (f["tuned_params"] for f in finalists_tuned if f["model"] == "RandomForestRegressor"),
+        dict(DEFAULT_RF),
+    )
+    best_et_params = next(
+        (f["tuned_params"] for f in finalists_tuned if f["model"] == "ExtraTreesRegressor"),
+        dict(DEFAULT_RF),
+    )
+    tune_note = (
+        f"benchmark_val_date={val_local} winner={chosen_name} target={chosen_target_mode} "
+        f"feature_variant={feature_variant_label}"
+    )
+    if benchmark_skip_reason:
+        tune_note += f" | note={benchmark_skip_reason}"
 
     mae_today = mape_today = rmse_today = bias_today = None
     preds_df = pd.DataFrame()
@@ -541,8 +812,8 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
 
     if not holdout_df.empty:
         X_h = holdout_df[feats]
-        y_hat_log = pipe.predict(X_h)
-        y_hat = np.expm1(y_hat_log)
+        y_hat_raw_space = pipe.predict(X_h)
+        y_hat = _preds_to_dollars(y_hat_raw_space, chosen_target_mode)
 
         preds_df = pd.DataFrame(
             {
@@ -570,14 +841,19 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         try:
             m_perm = holdout_df[TARGET_ORIGINAL].notna()
             if m_perm.any():
-                y_perm_log = holdout_df.loc[m_perm, TARGET_LOG].values
+                if chosen_target_mode == "log":
+                    y_perm = holdout_df.loc[m_perm, TARGET_LOG].values
+                    perm_scoring = dollar_mae_scorer
+                else:
+                    y_perm = holdout_df.loc[m_perm, TARGET_ORIGINAL].values.astype(float)
+                    perm_scoring = raw_dollar_mae_scorer
                 r = permutation_importance(
                     pipe,
                     X_h.loc[m_perm],
-                    y_perm_log,
+                    y_perm,
                     n_repeats=15,
                     random_state=42,
-                    scoring=dollar_mae_scorer,
+                    scoring=perm_scoring,
                     n_jobs=-1,
                 )
                 names = np.array(feats)
@@ -602,7 +878,47 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
             "best_params": best_et_params,
         },
         "selected": chosen_name,
-        "selection_rule": "lower tune validation MAE on original dollar scale (second-to-last local date)",
+        "selected_target_strategy": chosen_target_mode,
+        "selection_rule": (
+            "time-aware validation on second-latest local date (dollar MAE/RMSE/bias); "
+            "benchmark 4 models x (raw|log) targets; tune top 2 (model,target) pairs; "
+            "winner = lowest post-tune val MAE then RMSE then |bias|; final holdout = latest local date"
+        ),
+    }
+
+    target_transform_desc = (
+        f"log1p({TARGET_ORIGINAL})" if chosen_target_mode == "log" else f"{TARGET_ORIGINAL} raw USD"
+    )
+    metrics_scale_desc = (
+        "original_usd (expm1 predictions vs actual price_num)"
+        if chosen_target_mode == "log"
+        else "original_usd (direct predictions vs actual price_num)"
+    )
+    target_training_col = TARGET_LOG if chosen_target_mode == "log" else TARGET_ORIGINAL
+    feature_notes_txt = (
+        "variant B: vehicle_age, log_mileage, cylinders, year_num, mileage_num (+ categoricals)"
+        if feature_variant_label == "B"
+        else (
+            "variant A: vehicle_age, log_mileage, cylinders (+ categoricals); "
+            "year_num/mileage_num omitted as redundant with age/log mileage"
+        )
+    )
+
+    benchmark_block = {
+        "model_candidates": [
+            "DecisionTreeRegressor",
+            "RandomForestRegressor",
+            "ExtraTreesRegressor",
+            "HistGradientBoostingRegressor",
+        ],
+        "target_strategies_compared": ["raw", "log"],
+        "validation_date_local": str(val_local) if val_local is not None else None,
+        "holdout_date_local": str(today_local),
+        "feature_variant": feature_variant_label,
+        "skip_reason": benchmark_skip_reason,
+        "candidate_results": candidate_results,
+        "tuned_finalists": finalists_tuned,
+        "filtering_applied": filter_stats,
     }
 
     metrics = {
@@ -622,8 +938,11 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         "chosen_model": chosen_name,
         "chosen_model_params": chosen_params,
         "model_comparison": model_comparison,
-        "target_transform": f"log1p({TARGET_ORIGINAL})",
-        "metrics_scale": "original_usd (expm1 predictions vs actual price_num)",
+        "target_strategy": chosen_target_mode,
+        "target_training": target_training_col,
+        "target_transform": target_transform_desc,
+        "metrics_scale": metrics_scale_desc,
+        "benchmark": benchmark_block,
         "filtering": filter_stats,
         "data_key": DATA_KEY,
         "model": chosen_name,
@@ -633,12 +952,18 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         "run_id": run_id,
         "data_key": DATA_KEY,
         "target": TARGET_ORIGINAL,
-        "target_training": TARGET_LOG,
-        "target_transform": "log1p(price_num); predictions back-transformed with numpy.expm1",
+        "target_training": target_training_col,
+        "target_transform": (
+            "log1p(price_num); holdout predictions back-transformed with numpy.expm1"
+            if chosen_target_mode == "log"
+            else "price_num in USD; no log transform"
+        ),
+        "target_strategy": chosen_target_mode,
         "features": feats,
         "categorical_features": cat_cols,
         "numeric_features": num_cols,
-        "feature_notes": "vehicle_age and log_mileage only (year_num and mileage_num omitted as redundant)",
+        "feature_variant": feature_variant_label,
+        "feature_notes": feature_notes_txt,
         "timezone": TIMEZONE,
         "eval_date_local": str(today_local),
         "random_forest_params": best_rf_params,
@@ -646,6 +971,7 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         "chosen_model": chosen_name,
         "chosen_model_params": chosen_params,
         "model_comparison": model_comparison,
+        "benchmark": benchmark_block,
         "filtering": filter_stats,
         "pipeline": f"ColumnTransformer(SimpleImputer+OneHotEncoder) -> {chosen_name}",
         "tuning_note": tune_note,
@@ -675,6 +1001,8 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
                     "mape": mape_today,
                     "rmse": rmse_today,
                     "bias": bias_today,
+                    "model": chosen_name,
+                    "target_strategy": chosen_target_mode,
                 }
             ]
         )
@@ -705,7 +1033,7 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
                     features=[fname],
                     ax=ax,
                 )
-                ax.set_title(f"PDP: {fname} (log target)")
+                ax.set_title(f"PDP: {fname} ({chosen_target_mode} target)")
                 fig.tight_layout()
                 buf = io.BytesIO()
                 fig.savefig(buf, format="png", dpi=120)
@@ -728,6 +1056,9 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
             json.dumps(model_info, indent=2, default=str),
         )
 
+        tune_val_mae_hist = None
+        if finalists_tuned:
+            tune_val_mae_hist = finalists_tuned[0].get("validation_after_tune", {}).get("val_mae")
         hist_row = {
             "run_id": run_id,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -740,6 +1071,8 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
             "holdout_rows": len(holdout_df),
             "data_key": DATA_KEY,
             "model": chosen_name,
+            "target_strategy": chosen_target_mode,
+            "tune_validation_mae": tune_val_mae_hist,
         }
         prev = _read_text_from_gcs(client, GCS_BUCKET, METRICS_HISTORY_KEY)
         if prev:
@@ -779,6 +1112,10 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
         "mape": mape_today,
         "rmse": rmse_today,
         "bias": bias_today,
+        "chosen_model": chosen_name,
+        "chosen_target_strategy": chosen_target_mode,
+        "feature_variant": feature_variant_label,
+        "benchmark_rows": len(candidate_results),
         "run_prefix": f"gs://{GCS_BUCKET}/{run_prefix}/",
         "dry_run": dry_run,
         "timezone": TIMEZONE,
