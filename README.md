@@ -31,7 +31,7 @@ The **scraper is unchanged**. Downstream, the pipeline runs **RegEx + Vertex Gem
 
 ---
 
-## Enriched fields (high level)
+## Enriched fields
 
 Beyond core listing fields (e.g. price, year, make, model, mileage, transmission), the pipeline adds attributes such as **color**, **city**, **state**, **zip_code**, **drive**, **fuel**, **condition**, **title_status**, **type**, **cylinders**, and **seller_type** (plus LLM provenance columns in the master CSV). ZIPs stay **string-safe** for training; ambiguous enrichment is nulled rather than guessed.
 
@@ -76,7 +76,7 @@ Older flat prediction files live under **`archive/legacy_predictions/`** and are
 
 ## Notebook
 
-**[`notebooks/model_trending.ipynb`](notebooks/model_trending.ipynb)** is the main **grader-facing** summary:
+**[`notebooks/model_trending.ipynb`](notebooks/model_trending.ipynb)** is the main summary:
 
 - Reads **synced repo artifacts only** (no retraining, **no GCP credentials**).
 - Shows **metric trends**, **benchmark comparison**, final **holdout metrics**, **permutation importance**, **PDPs**, and short **interpretation** text.
@@ -85,7 +85,7 @@ For **Colab**, the default clone URL is the course repo; use **`NOTEBOOK_REPO_UR
 
 ---
 
-## How to run (high level)
+## How to run
 
 1. Deploy the Cloud Functions (workflows in `.github/workflows/`).
 2. Run ETL + **materialize** so **`structured/datasets/listings_master_llm.csv`** exists.
