@@ -1,0 +1,70 @@
+{
+  "run_id": "2026040411",
+  "timezone": "America/New_York",
+  "eval_date_local": "2026-04-04",
+  "train_rows": 269,
+  "holdout_rows": 202,
+  "mae": 3922.9869980171015,
+  "mape": 43.87379415330514,
+  "rmse": 10534.934740115154,
+  "bias": -2259.095668710085,
+  "baseline_dt_mae_tune_val": 6024.7651038841495,
+  "tuning": "val_date=2026-04-03 rf_tune_mae_dollars=4427.24 et_tune_mae_dollars=4898.43",
+  "best_rf_params": {
+    "n_estimators": 200,
+    "min_samples_leaf": 1,
+    "max_features": 0.5,
+    "max_depth": 28
+  },
+  "best_extra_trees_params": {
+    "n_estimators": 200,
+    "min_samples_leaf": 1,
+    "max_features": 0.5,
+    "max_depth": 28
+  },
+  "chosen_model": "RandomForestRegressor",
+  "chosen_model_params": {
+    "n_estimators": 200,
+    "min_samples_leaf": 1,
+    "max_features": 0.5,
+    "max_depth": 28
+  },
+  "model_comparison": {
+    "random_forest": {
+      "tune_val_mae_dollars": 4427.24418677449,
+      "best_params": {
+        "n_estimators": 200,
+        "min_samples_leaf": 1,
+        "max_features": 0.5,
+        "max_depth": 28
+      }
+    },
+    "extra_trees": {
+      "tune_val_mae_dollars": 4898.429275823367,
+      "best_params": {
+        "n_estimators": 200,
+        "min_samples_leaf": 1,
+        "max_features": 0.5,
+        "max_depth": 28
+      }
+    },
+    "selected": "RandomForestRegressor",
+    "selection_rule": "lower tune validation MAE on original dollar scale (second-to-last local date)"
+  },
+  "target_transform": "log1p(price_num)",
+  "metrics_scale": "original_usd (expm1 predictions vs actual price_num)",
+  "filtering": {
+    "input_rows": 516,
+    "dropped_missing_or_nonpositive_price": 15,
+    "dropped_extreme_price": 1,
+    "dropped_bad_year": 20,
+    "dropped_bad_mileage": 3,
+    "dropped_title_status_nonstandard": 4,
+    "dropped_condition_project": 2,
+    "output_rows": 471,
+    "rows_removed_total": 45,
+    "pct_rows_removed": 8.72
+  },
+  "data_key": "structured/datasets/listings_master_llm.csv",
+  "model": "RandomForestRegressor"
+}
