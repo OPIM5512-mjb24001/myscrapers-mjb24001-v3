@@ -98,6 +98,7 @@ Each run writes to **`structured/model_runs/<YYYYMMDDHH>/`** in GCS (mirrored in
 | `predictions.csv` | Holdout actual vs predicted price |
 | `metrics.json`, `metrics.csv` | Final metrics and run metadata |
 | `model_benchmark.csv` | Validation benchmark rows; marks the selected configuration |
+| `tuning_trials.csv` | Every `ParameterSampler` trial on the validation day (MAE/RMSE/MAPE/bias/composite) |
 | `permutation_importance.csv` | Feature importance on the holdout |
 | `pdp/pdp_top*.png` | **Top 3** partial dependence plots |
 | `model_info.json` | Model and preprocessing summary |

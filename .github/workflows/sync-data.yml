@@ -67,6 +67,7 @@ jobs:
           gsutil cp "${LATEST_DIR}permutation_importance.csv" "results/permutation_importance/${RUN_ID}-permutation_importance.csv" 2>/dev/null || true
           gsutil cp "${LATEST_DIR}model_info.json" "results/metrics/${RUN_ID}-model_info.json" 2>/dev/null || true
           gsutil cp "${LATEST_DIR}model_benchmark.csv" "results/metrics/${RUN_ID}-model_benchmark.csv" 2>/dev/null || true
+          gsutil cp "${LATEST_DIR}tuning_trials.csv" "results/metrics/${RUN_ID}-tuning_trials.csv" 2>/dev/null || true
 
           while IFS= read -r blob; do
             [[ -z "$blob" ]] && continue

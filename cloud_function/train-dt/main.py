@@ -460,6 +460,49 @@ def _benchmark_sort_key(row: dict[str, Any]) -> tuple[float, float, float, float
     )
 
 
+def _append_tuning_trial_row(
+    trial_sink: list[dict[str, Any]] | None,
+    model_name: str,
+    target_mode: TargetMode,
+    trial_id: int,
+    params: dict[str, Any],
+    row: dict[str, Any] | None,
+) -> None:
+    if trial_sink is None:
+        return
+    p_json = json.dumps(params, sort_keys=True, default=str)
+    if row is None:
+        trial_sink.append(
+            {
+                "model": model_name,
+                "target_strategy": target_mode,
+                "trial_id": trial_id,
+                "params": p_json,
+                "val_mae": None,
+                "val_rmse": None,
+                "val_mape": None,
+                "val_bias": None,
+                "val_composite": float("nan"),
+            }
+        )
+        return
+    trial_sink.append(
+        {
+            "model": model_name,
+            "target_strategy": target_mode,
+            "trial_id": trial_id,
+            "params": p_json,
+            "val_mae": row.get("val_mae"),
+            "val_rmse": row.get("val_rmse"),
+            "val_mape": row.get("val_mape"),
+            "val_bias": row.get("val_bias"),
+            "val_composite": _val_composite_score(
+                row.get("val_mae"), row.get("val_rmse"), row.get("val_bias")
+            ),
+        }
+    )
+
+
 def _tune_on_val(
     model_name: str,
     build_reg: Callable[[dict[str, Any]], Any],
@@ -472,6 +515,7 @@ def _tune_on_val(
     tune_val: pd.DataFrame,
     n_iter: int,
     default_params: dict[str, Any],
+    trial_sink: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], float, dict[str, float]]:
     y_tr = _y_for_target(tune_train, target_mode)
     y_va_space = _y_for_target(tune_val, target_mode)
@@ -479,13 +523,16 @@ def _tune_on_val(
     best_params: dict[str, Any] = {}
     best_mae = float("inf")
     best_metrics: dict[str, float] = {}
+    trial_id = 0
     for params in ParameterSampler(param_grid, n_iter=n_iter, random_state=42):
+        trial_id += 1
         p = dict(params)
         try:
             reg = build_reg(p)
             row = _benchmark_one(
                 model_name, reg, target_mode, cat_cols, num_cols, feats, tune_train, tune_val
             )
+            _append_tuning_trial_row(trial_sink, model_name, target_mode, trial_id, p, row)
             if row is None:
                 continue
             mae = row["val_mae"]
@@ -500,10 +547,20 @@ def _tune_on_val(
                 }
         except Exception as ex:
             logging.warning("Tune iteration failed (%s): %s", model_name, ex)
+            _append_tuning_trial_row(trial_sink, model_name, target_mode, trial_id, p, None)
     if not best_params or not np.isfinite(best_mae):
         reg0 = build_reg(default_params)
         row = _benchmark_one(
             model_name, reg0, target_mode, cat_cols, num_cols, feats, tune_train, tune_val
+        )
+        trial_id += 1
+        _append_tuning_trial_row(
+            trial_sink,
+            model_name,
+            target_mode,
+            trial_id,
+            dict(default_params),
+            row,
         )
         return dict(default_params), float(row["val_mae"]) if row else float("nan"), (
             {k: float(row[k]) for k in ("val_mae", "val_rmse", "val_mape", "val_bias")} if row else {}
@@ -773,6 +830,7 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
     tune_val = pd.DataFrame()
     candidate_results: list[dict[str, Any]] = []
     finalists_tuned: list[dict[str, Any]] = []
+    tuning_trials_all: list[dict[str, Any]] = []
     feature_variant_label = "A"
     num_cols: list[str] = []
     feats: list[str] = []
@@ -838,6 +896,7 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
                     tune_val,
                     n_it,
                     defs,
+                    trial_sink=tuning_trials_all,
                 )
                 finalists_tuned.append(
                     {
@@ -1187,6 +1246,33 @@ def run_once(dry_run: bool = False) -> dict[str, Any]:
             GCS_BUCKET,
             f"{run_prefix}/model_benchmark.csv",
             bench_df.to_csv(index=False),
+            "text/csv",
+        )
+
+        tune_cols = [
+            "run_id",
+            "model",
+            "target_strategy",
+            "trial_id",
+            "params",
+            "val_mae",
+            "val_rmse",
+            "val_mape",
+            "val_bias",
+            "val_composite",
+        ]
+        for tr in tuning_trials_all:
+            tr["run_id"] = run_id
+        tune_df = pd.DataFrame(tuning_trials_all)
+        if tune_df.empty:
+            tune_df = pd.DataFrame(columns=tune_cols)
+        else:
+            tune_df = tune_df.reindex(columns=tune_cols)
+        _write_text_to_gcs(
+            client,
+            GCS_BUCKET,
+            f"{run_prefix}/tuning_trials.csv",
+            tune_df.to_csv(index=False),
             "text/csv",
         )
 
