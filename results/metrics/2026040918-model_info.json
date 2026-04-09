@@ -1,0 +1,267 @@
+{
+  "run_id": "2026040918",
+  "data_key": "structured/datasets/listings_master_llm.csv",
+  "target": "price_num",
+  "target_training": "price_num",
+  "target_transform": "price_num in USD; no log transform",
+  "target_strategy": "raw",
+  "features": [
+    "make",
+    "model",
+    "transmission",
+    "fuel",
+    "drive",
+    "condition",
+    "title_status",
+    "type",
+    "seller_type",
+    "state",
+    "city",
+    "zip_prefix",
+    "vehicle_age",
+    "log_mileage",
+    "year_num",
+    "mileage_num",
+    "cylinders"
+  ],
+  "categorical_features": [
+    "make",
+    "model",
+    "transmission",
+    "fuel",
+    "drive",
+    "condition",
+    "title_status",
+    "type",
+    "seller_type",
+    "state",
+    "city",
+    "zip_prefix"
+  ],
+  "numeric_features": [
+    "vehicle_age",
+    "log_mileage",
+    "year_num",
+    "mileage_num",
+    "cylinders"
+  ],
+  "feature_variant": "C",
+  "feature_notes": "variant C: vehicle_age, log_mileage, year_num, mileage_num, cylinders (+ categoricals); redundant pairs allowed if validation probe (RF+log) favors them",
+  "timezone": "America/New_York",
+  "eval_date_local": "2026-04-09",
+  "random_forest_params": {
+    "n_estimators": 300,
+    "max_depth": 20,
+    "min_samples_leaf": 6,
+    "max_features": "sqrt"
+  },
+  "extra_trees_params": {
+    "n_estimators": 300,
+    "max_depth": 20,
+    "min_samples_leaf": 6,
+    "max_features": "sqrt"
+  },
+  "chosen_model": "HistGradientBoostingRegressor",
+  "chosen_model_params": {
+    "min_samples_leaf": 20,
+    "max_leaf_nodes": 15,
+    "max_iter": 200,
+    "max_depth": null,
+    "learning_rate": 0.08
+  },
+  "model_comparison": {
+    "random_forest": {
+      "tune_val_mae_dollars": null,
+      "best_params": {
+        "n_estimators": 300,
+        "max_depth": 20,
+        "min_samples_leaf": 6,
+        "max_features": "sqrt"
+      }
+    },
+    "extra_trees": {
+      "tune_val_mae_dollars": null,
+      "best_params": {
+        "n_estimators": 300,
+        "max_depth": 20,
+        "min_samples_leaf": 6,
+        "max_features": "sqrt"
+      }
+    },
+    "selected": "HistGradientBoostingRegressor",
+    "selected_target_strategy": "raw",
+    "selection_rule": "time-aware validation on second-latest local date; metrics in USD (log models via expm1); benchmark 4 models x (raw|log); tune top 2 (model,target) pairs; winner = lowest val_composite = MAE + 0.0025*RMSE + 0.12*|bias| then MAE, RMSE, |bias|; MAPE shown but not used for ranking; final holdout = latest local date"
+  },
+  "benchmark": {
+    "model_candidates": [
+      "DecisionTreeRegressor",
+      "RandomForestRegressor",
+      "ExtraTreesRegressor",
+      "HistGradientBoostingRegressor"
+    ],
+    "target_strategies_compared": [
+      "raw",
+      "log"
+    ],
+    "validation_date_local": "2026-04-08",
+    "holdout_date_local": "2026-04-09",
+    "feature_variant": "C",
+    "validation_ranking": {
+      "val_composite_formula": "MAE + 0.0025*RMSE + 0.12*abs(bias)",
+      "note": "Lower val_composite is better for ranking benchmark rows and tuned finalists."
+    },
+    "skip_reason": null,
+    "candidate_results": [
+      {
+        "model": "HistGradientBoostingRegressor",
+        "target_strategy": "raw",
+        "val_mae": 4520.906120290471,
+        "val_rmse": 7694.558027474066,
+        "val_mape": 55.7702744616098,
+        "val_bias": -1530.579280593509,
+        "validation_date_local": "2026-04-08",
+        "feature_variant": "C"
+      },
+      {
+        "model": "HistGradientBoostingRegressor",
+        "target_strategy": "log",
+        "val_mae": 4465.8075697382255,
+        "val_rmse": 8805.72928272414,
+        "val_mape": 41.0220472895724,
+        "val_bias": -2665.577142998892,
+        "validation_date_local": "2026-04-08",
+        "feature_variant": "C"
+      },
+      {
+        "model": "DecisionTreeRegressor",
+        "target_strategy": "raw",
+        "val_mae": 5312.909938756422,
+        "val_rmse": 8853.922681296564,
+        "val_mape": 74.67272340566392,
+        "val_bias": -1961.8732696303412,
+        "validation_date_local": "2026-04-08",
+        "feature_variant": "C"
+      },
+      {
+        "model": "DecisionTreeRegressor",
+        "target_strategy": "log",
+        "val_mae": 5426.770392353612,
+        "val_rmse": 9507.505739487759,
+        "val_mape": 66.0847911584605,
+        "val_bias": -2520.909212875313,
+        "validation_date_local": "2026-04-08",
+        "feature_variant": "C"
+      },
+      {
+        "model": "ExtraTreesRegressor",
+        "target_strategy": "log",
+        "val_mae": 5656.752596135772,
+        "val_rmse": 9993.641164263694,
+        "val_mape": 59.48934961395962,
+        "val_bias": -3231.049190286817,
+        "validation_date_local": "2026-04-08",
+        "feature_variant": "C"
+      },
+      {
+        "model": "RandomForestRegressor",
+        "target_strategy": "log",
+        "val_mae": 5709.864540597037,
+        "val_rmse": 10265.107955438107,
+        "val_mape": 61.010039384244244,
+        "val_bias": -3280.4581477302922,
+        "validation_date_local": "2026-04-08",
+        "feature_variant": "C"
+      },
+      {
+        "model": "RandomForestRegressor",
+        "target_strategy": "raw",
+        "val_mae": 6248.108286508064,
+        "val_rmse": 9212.319421633742,
+        "val_mape": 112.39250053603081,
+        "val_bias": -514.9436108323872,
+        "validation_date_local": "2026-04-08",
+        "feature_variant": "C"
+      },
+      {
+        "model": "ExtraTreesRegressor",
+        "target_strategy": "raw",
+        "val_mae": 6357.949384128509,
+        "val_rmse": 8862.65533694889,
+        "val_mape": 111.11896783196993,
+        "val_bias": -197.14325192889817,
+        "validation_date_local": "2026-04-08",
+        "feature_variant": "C"
+      }
+    ],
+    "tuned_finalists": [
+      {
+        "model": "HistGradientBoostingRegressor",
+        "target_strategy": "raw",
+        "tuned_params": {
+          "min_samples_leaf": 20,
+          "max_leaf_nodes": 15,
+          "max_iter": 200,
+          "max_depth": null,
+          "learning_rate": 0.08
+        },
+        "validation_after_tune": {
+          "val_mae": 3741.5133128037546,
+          "val_rmse": 7162.99162596335,
+          "val_mape": 47.70789367851753,
+          "val_bias": -825.954116822828
+        }
+      },
+      {
+        "model": "HistGradientBoostingRegressor",
+        "target_strategy": "log",
+        "tuned_params": {
+          "min_samples_leaf": 20,
+          "max_leaf_nodes": 15,
+          "max_iter": 200,
+          "max_depth": null,
+          "learning_rate": 0.08
+        },
+        "validation_after_tune": {
+          "val_mae": 3625.5388239111835,
+          "val_rmse": 7796.6789217784235,
+          "val_mape": 32.33277412241085,
+          "val_bias": -1874.5918471417565
+        }
+      }
+    ],
+    "filtering_applied": {
+      "input_rows": 661,
+      "min_price_usd": 500.0,
+      "max_price_usd": 500000.0,
+      "min_model_year": 1980,
+      "max_mileage_cap": 450000.0,
+      "dropped_missing_or_nonpositive_price": 18,
+      "dropped_extreme_price": 1,
+      "dropped_bad_year": 25,
+      "dropped_bad_mileage": 5,
+      "dropped_title_status_nonstandard": 4,
+      "dropped_condition_project": 2,
+      "output_rows": 606,
+      "rows_removed_total": 55,
+      "pct_rows_removed": 8.32
+    }
+  },
+  "filtering": {
+    "input_rows": 661,
+    "min_price_usd": 500.0,
+    "max_price_usd": 500000.0,
+    "min_model_year": 1980,
+    "max_mileage_cap": 450000.0,
+    "dropped_missing_or_nonpositive_price": 18,
+    "dropped_extreme_price": 1,
+    "dropped_bad_year": 25,
+    "dropped_bad_mileage": 5,
+    "dropped_title_status_nonstandard": 4,
+    "dropped_condition_project": 2,
+    "output_rows": 606,
+    "rows_removed_total": 55,
+    "pct_rows_removed": 8.32
+  },
+  "pipeline": "ColumnTransformer(SimpleImputer+OneHotEncoder) -> HistGradientBoostingRegressor",
+  "tuning_note": "benchmark_val_date=2026-04-08 winner=HistGradientBoostingRegressor target=raw feature_variant=C"
+}
