@@ -1,0 +1,231 @@
+{
+  "run_id": "2026040903",
+  "timezone": "America/New_York",
+  "eval_date_local": "2026-04-08",
+  "train_rows": 328,
+  "holdout_rows": 271,
+  "mae": 3946.1964795223507,
+  "mape": 68.45525665140298,
+  "rmse": 9125.57327617642,
+  "bias": -175.77707765505477,
+  "baseline_dt_mae_tune_val": 5941.294045294531,
+  "tuning": "benchmark_val_date=2026-04-07 winner=HistGradientBoostingRegressor target=raw feature_variant=B",
+  "best_rf_params": {
+    "n_estimators": 100,
+    "min_samples_leaf": 2,
+    "max_features": 0.3,
+    "max_depth": 10
+  },
+  "best_extra_trees_params": {
+    "n_estimators": 300,
+    "max_depth": 20,
+    "min_samples_leaf": 6,
+    "max_features": "sqrt"
+  },
+  "chosen_model": "HistGradientBoostingRegressor",
+  "chosen_model_params": {
+    "min_samples_leaf": 20,
+    "max_leaf_nodes": 31,
+    "max_iter": 250,
+    "max_depth": 10,
+    "learning_rate": 0.05
+  },
+  "model_comparison": {
+    "random_forest": {
+      "tune_val_mae_dollars": 5346.46901490702,
+      "best_params": {
+        "n_estimators": 100,
+        "min_samples_leaf": 2,
+        "max_features": 0.3,
+        "max_depth": 10
+      }
+    },
+    "extra_trees": {
+      "tune_val_mae_dollars": null,
+      "best_params": {
+        "n_estimators": 300,
+        "max_depth": 20,
+        "min_samples_leaf": 6,
+        "max_features": "sqrt"
+      }
+    },
+    "selected": "HistGradientBoostingRegressor",
+    "selected_target_strategy": "raw",
+    "selection_rule": "time-aware validation on second-latest local date; metrics in USD (log models via expm1); benchmark 4 models x (raw|log); tune top 2 (model,target) pairs; winner = lowest val_composite = MAE + 0.0025*RMSE + 0.12*|bias| then MAE, RMSE, |bias|; MAPE shown but not used for ranking; final holdout = latest local date"
+  },
+  "target_strategy": "raw",
+  "target_training": "price_num",
+  "target_transform": "price_num raw USD",
+  "metrics_scale": "original_usd (direct predictions vs actual price_num)",
+  "benchmark": {
+    "model_candidates": [
+      "DecisionTreeRegressor",
+      "RandomForestRegressor",
+      "ExtraTreesRegressor",
+      "HistGradientBoostingRegressor"
+    ],
+    "target_strategies_compared": [
+      "raw",
+      "log"
+    ],
+    "validation_date_local": "2026-04-07",
+    "holdout_date_local": "2026-04-08",
+    "feature_variant": "B",
+    "validation_ranking": {
+      "val_composite_formula": "MAE + 0.0025*RMSE + 0.12*abs(bias)",
+      "note": "Lower val_composite is better for ranking benchmark rows and tuned finalists."
+    },
+    "skip_reason": null,
+    "candidate_results": [
+      {
+        "model": "RandomForestRegressor",
+        "target_strategy": "raw",
+        "val_mae": 5539.924850425374,
+        "val_rmse": 9139.529638058959,
+        "val_mape": 42.92083133544137,
+        "val_bias": -2596.9057533784717,
+        "validation_date_local": "2026-04-07",
+        "feature_variant": "B"
+      },
+      {
+        "model": "HistGradientBoostingRegressor",
+        "target_strategy": "raw",
+        "val_mae": 5667.840332357267,
+        "val_rmse": 8074.834628660924,
+        "val_mape": 42.20193758805477,
+        "val_bias": -3095.0704951100242,
+        "validation_date_local": "2026-04-07",
+        "feature_variant": "B"
+      },
+      {
+        "model": "HistGradientBoostingRegressor",
+        "target_strategy": "log",
+        "val_mae": 5658.136810677809,
+        "val_rmse": 8825.755212700082,
+        "val_mape": 35.66396925283914,
+        "val_bias": -4717.369628413369,
+        "validation_date_local": "2026-04-07",
+        "feature_variant": "B"
+      },
+      {
+        "model": "ExtraTreesRegressor",
+        "target_strategy": "raw",
+        "val_mae": 6125.586070114242,
+        "val_rmse": 9358.485344905583,
+        "val_mape": 50.73012693335731,
+        "val_bias": -1561.8283839232058,
+        "validation_date_local": "2026-04-07",
+        "feature_variant": "B"
+      },
+      {
+        "model": "DecisionTreeRegressor",
+        "target_strategy": "raw",
+        "val_mae": 6052.386705725354,
+        "val_rmse": 8325.470721760115,
+        "val_mape": 44.45075412806605,
+        "val_bias": -3217.423098438738,
+        "validation_date_local": "2026-04-07",
+        "feature_variant": "B"
+      },
+      {
+        "model": "DecisionTreeRegressor",
+        "target_strategy": "log",
+        "val_mae": 5941.294045294531,
+        "val_rmse": 8842.844375728608,
+        "val_mape": 39.99098635467917,
+        "val_bias": -4471.8957246905475,
+        "validation_date_local": "2026-04-07",
+        "feature_variant": "B"
+      },
+      {
+        "model": "ExtraTreesRegressor",
+        "target_strategy": "log",
+        "val_mae": 6099.005218275731,
+        "val_rmse": 11127.118839926652,
+        "val_mape": 34.112143780786155,
+        "val_bias": -5087.7497409609,
+        "validation_date_local": "2026-04-07",
+        "feature_variant": "B"
+      },
+      {
+        "model": "RandomForestRegressor",
+        "target_strategy": "log",
+        "val_mae": 6358.022868579445,
+        "val_rmse": 11175.71597541453,
+        "val_mape": 36.502253378220736,
+        "val_bias": -5603.400313048389,
+        "validation_date_local": "2026-04-07",
+        "feature_variant": "B"
+      }
+    ],
+    "tuned_finalists": [
+      {
+        "model": "HistGradientBoostingRegressor",
+        "target_strategy": "raw",
+        "tuned_params": {
+          "min_samples_leaf": 20,
+          "max_leaf_nodes": 31,
+          "max_iter": 250,
+          "max_depth": 10,
+          "learning_rate": 0.05
+        },
+        "validation_after_tune": {
+          "val_mae": 5287.440956471005,
+          "val_rmse": 7834.066462677168,
+          "val_mape": 38.69513649969028,
+          "val_bias": -3074.648476150647
+        }
+      },
+      {
+        "model": "RandomForestRegressor",
+        "target_strategy": "raw",
+        "tuned_params": {
+          "n_estimators": 100,
+          "min_samples_leaf": 2,
+          "max_features": 0.3,
+          "max_depth": 10
+        },
+        "validation_after_tune": {
+          "val_mae": 5346.46901490702,
+          "val_rmse": 8206.496451026343,
+          "val_mape": 37.43984634790773,
+          "val_bias": -2975.802968828818
+        }
+      }
+    ],
+    "filtering_applied": {
+      "input_rows": 652,
+      "min_price_usd": 500.0,
+      "max_price_usd": 500000.0,
+      "min_model_year": 1980,
+      "max_mileage_cap": 450000.0,
+      "dropped_missing_or_nonpositive_price": 18,
+      "dropped_extreme_price": 0,
+      "dropped_bad_year": 25,
+      "dropped_bad_mileage": 4,
+      "dropped_title_status_nonstandard": 4,
+      "dropped_condition_project": 2,
+      "output_rows": 599,
+      "rows_removed_total": 53,
+      "pct_rows_removed": 8.13
+    }
+  },
+  "filtering": {
+    "input_rows": 652,
+    "min_price_usd": 500.0,
+    "max_price_usd": 500000.0,
+    "min_model_year": 1980,
+    "max_mileage_cap": 450000.0,
+    "dropped_missing_or_nonpositive_price": 18,
+    "dropped_extreme_price": 0,
+    "dropped_bad_year": 25,
+    "dropped_bad_mileage": 4,
+    "dropped_title_status_nonstandard": 4,
+    "dropped_condition_project": 2,
+    "output_rows": 599,
+    "rows_removed_total": 53,
+    "pct_rows_removed": 8.13
+  },
+  "data_key": "structured/datasets/listings_master_llm.csv",
+  "model": "HistGradientBoostingRegressor"
+}
