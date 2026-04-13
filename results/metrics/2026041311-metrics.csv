@@ -1,0 +1,2 @@
+run_id,eval_date_local,mae,mape,rmse,bias,model,target_strategy
+2026041311,2026-04-13,3446.168346096936,58.525224616857905,8726.237801818015,-491.1345120113472,RandomForestRegressor,raw
